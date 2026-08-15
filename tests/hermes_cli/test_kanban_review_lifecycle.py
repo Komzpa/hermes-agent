@@ -684,6 +684,41 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     assert captured == [["domain-specific-review", "sdlc-review"]]
 
 
+def test_review_reopen_bypasses_active_pr_guard_only_during_correction(
+    kanban_home: Path,
+) -> None:
+    """An explicit correction reuses its PR without weakening duplicate guards."""
+    pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="correct same PR", assignee="worker")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        kb.add_comment(conn, task_id, author="worker", body=pr_comment)
+        assert kb.request_review(
+            conn, task_id, summary="PR ready",
+            expected_run_id=implementation.current_run_id,
+        )
+
+        assert kb.reopen_review_task(conn, task_id)
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+        correction = kb.claim_task(conn, task_id)
+        assert correction is not None
+        assert kb.request_review(
+            conn, task_id, summary="Corrections ready",
+            expected_run_id=correction.current_run_id,
+        )
+        # A later accidental ready transition must not inherit the old bypass.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ?",
+                (task_id,),
+            )
+        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+
+
 def test_review_dispatch_honors_global_and_per_profile_caps(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
