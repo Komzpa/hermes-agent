@@ -158,6 +158,14 @@ VALID_HOOKS: set[str] = {
     # spawn; completed/blocked fire in the WORKER (or whichever process drove it). Kwargs: task_id,
     # board, assignee, run_id, profile_name; completed adds summary, blocked adds reason.
     "kanban_task_claimed", "kanban_task_completed", "kanban_task_blocked",
+    # Fail-closed gate immediately before a dispatcher claims a task. Unlike
+    # the lifecycle observers above, callbacks may veto a claim by returning
+    # ``{"action": "skip", "reason": "..."}``. ``None`` or
+    # ``{"action": "allow"}`` allows it. Callback failures and malformed
+    # non-None results are treated as vetoes by the dispatcher so an auth or
+    # provider preflight cannot accidentally fail open. Kwargs: task_id,
+    # board, assignee, lane ("ready" | "review"), profile_name.
+    "pre_kanban_task_claim",
     # Kanban worker/mutation/tick observers; returns ignored; fire sites short-circuit on
     # has_hook(). Kwargs: task_id, profile_name, board, assignee, run_id plus, per hook:
     # worker_spawned (DISPATCHER, after PID persisted, inside the dispatch lock — stay fast):

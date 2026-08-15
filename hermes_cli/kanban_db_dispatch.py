@@ -142,6 +142,11 @@ class DispatchResult:
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    preclaim_guarded: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` skipped before claim by ``pre_kanban_task_claim``.
+
+    Each entry is non-consuming: the task remains ready or in review, no run
+    is opened, and no failure attempt is charged."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -1549,6 +1554,112 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _run_preclaim_gate(
+    *, task_id: str, assignee: str, board: Optional[str], lane: str,
+) -> Optional[str]:
+    """Return a veto reason from the pre-claim plugin gate, if any.
+
+    Fail-closed once a subscriber exists: a broken provider/auth preflight
+    must never be indistinguishable from approval. With no subscriber the
+    legacy dispatch behavior is unchanged.
+    """
+    try:
+        from hermes_cli.plugins import has_hook, iter_hook_callbacks
+    except Exception:
+        return None
+    try:
+        if not has_hook("pre_kanban_task_claim"):
+            return None
+    except Exception as exc:
+        _log.warning("pre-claim gate failed for %s: %s", task_id, exc)
+        return "preclaim_gate_error"
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        try:
+            profile_name = get_active_profile_name()
+        except Exception:
+            profile_name = "default"
+    except Exception:
+        profile_name = "default"
+    payload = {
+        "task_id": task_id,
+        "board": board,
+        "assignee": assignee,
+        "lane": lane,
+        "profile_name": profile_name,
+        "telemetry_schema_version": 1,
+    }
+    try:
+        callbacks = iter_hook_callbacks("pre_kanban_task_claim")
+    except Exception as exc:
+        _log.warning("pre-claim hook failed for %s: %s", task_id, exc)
+        return "preclaim_hook_error"
+    for callback in callbacks:
+        try:
+            decision = callback(**payload)
+        except Exception as exc:
+            _log.warning("pre-claim hook failed for %s: %s", task_id, exc)
+            return "preclaim_hook_error"
+        if decision is None:
+            continue
+        if not isinstance(decision, dict):
+            return "preclaim_invalid_result"
+        action = decision.get("action", "allow")
+        if action == "allow":
+            continue
+        if action == "skip":
+            reason = str(decision.get("reason") or "preclaim_denied").strip()
+            return reason[:500]
+        return "preclaim_invalid_action"
+    return None
+
+
+def _record_preclaim_veto(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    task_id: str,
+    reason: str,
+) -> None:
+    result.preclaim_guarded.append((task_id, reason))
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, "preclaim_guarded", {"reason": reason})
+
+
+def _collect_preclaim_decisions(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str],
+    default_assignee: Optional[str],
+    dry_run: bool,
+) -> Optional[dict[str, Optional[str]]]:
+    """Run subscribed preflights before the dispatch lock is acquired."""
+    if dry_run:
+        return None
+    try:
+        from hermes_cli.plugins import has_hook
+
+        if not has_hook("pre_kanban_task_claim"):
+            return None
+    except Exception:
+        # Discovery itself failed. Return an active decision map so every
+        # candidate fails closed as not evaluated inside the locked pass.
+        return {}
+    fallback = (default_assignee or "").strip() or None
+    rows = conn.execute(
+        "SELECT id, assignee, status FROM tasks "
+        "WHERE status IN ('ready', 'review') AND claim_lock IS NULL"
+    ).fetchall()
+    return {
+        row["id"]: _run_preclaim_gate(
+            task_id=row["id"],
+            assignee=row["assignee"] or fallback or "",
+            board=board,
+            lane=row["status"],
+        )
+        for row in rows
+    }
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1996,6 +2107,11 @@ def dispatch_once(
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
     """
+    # Pre-claim plugin preflights run BEFORE the dispatch lock is acquired so
+    # a slow subscriber never extends the single-writer critical section.
+    preclaim_decisions = _collect_preclaim_decisions(
+        conn, board=board, default_assignee=default_assignee, dry_run=dry_run,
+    )
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
@@ -2010,6 +2126,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            preclaim_decisions=preclaim_decisions,
         )
 
     try:
@@ -2059,6 +2176,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    preclaim_decisions: Optional[dict[str, Optional[str]]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2107,6 +2225,12 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
+    if preclaim_decisions is not None:
+        preclaim_reason = preclaim_decisions.get(task_id, "preclaim_not_evaluated")
+        if preclaim_reason:
+            _record_preclaim_veto(conn, result, task_id, preclaim_reason)
+            return False
+
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
@@ -2362,6 +2486,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    preclaim_decisions: Optional[dict[str, Optional[str]]] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2417,6 +2542,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        preclaim_decisions=preclaim_decisions,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

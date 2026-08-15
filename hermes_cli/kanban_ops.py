@@ -110,6 +110,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "reason": reason}
                 for (tid, reason) in res.respawn_guarded
             ],
+            "preclaim_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.preclaim_guarded
+            ],
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
@@ -148,6 +152,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     for tid, reason in res.respawn_guarded:
         print(f"Guarded ({reason}): {tid}")
+    for tid, reason in res.preclaim_guarded:
+        print(f"Deferred (pre-claim gate: {reason}): {tid}")
     if res.rate_limited:
         print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
     if res.skipped_locked:
