@@ -74,7 +74,6 @@ def run_preflight_gate(
         # The outer-loop rebuild includes system prompt, request-only injections and
         # tool schemas; only that full request with output runway may be sent.
         v._provider_overflow_recovery_pending = False
-    # Compare fully assembled requests, not raw ``messages`` (which omit
     if v._preflight_compression_blocked and _preflight_block_outlived_its_request(
         v._preflight_blocked_at_tokens, request_pressure_tokens
     ):
@@ -89,6 +88,7 @@ def run_preflight_gate(
         )
         v._preflight_compression_blocked = False
         v._preflight_blocked_at_tokens = 0
+    # Compare fully assembled requests, not raw ``messages`` (which omit
     # api_content, plugin injections, prefills, MoA context, ephemeral system text).
     if (
         _last_preflight_pressure is not None
