@@ -71,7 +71,7 @@ class _RecallResult:
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+_MIN_CLIENT_VERSION = "0.8.4"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
@@ -89,6 +89,7 @@ _HINDSIGHT_GLYPH = "👁️"
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+_VALID_RECALL_MIN_SCORE_KEYS = {"semantic", "keyword", "reranker", "final"}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -111,6 +112,28 @@ def _parse_int_setting(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         logger.warning("Invalid integer Hindsight setting %r; using default %s", value, default)
         return default
+
+
+def _normalize_recall_min_scores(value: Any) -> dict[str, float] | None:
+    """Validate the request-stage floors supported by Hindsight recall."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("recall_min_scores must be a JSON object")
+
+    normalized: dict[str, float] = {}
+    for key, raw_score in value.items():
+        if key not in _VALID_RECALL_MIN_SCORE_KEYS:
+            allowed = ", ".join(sorted(_VALID_RECALL_MIN_SCORE_KEYS))
+            raise ValueError(f"unsupported recall_min_scores key {key!r}; expected one of: {allowed}")
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"recall_min_scores.{key} must be numeric") from exc
+        if not 0.0 <= score <= 1.0:
+            raise ValueError(f"recall_min_scores.{key} must be between 0 and 1")
+        normalized[key] = score
+    return normalized or None
 
 
 # Env var the embedded daemon manager reads (at import time, as a module-level
@@ -846,6 +869,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = True
         self._recall_sync = False
         self._recall_max_tokens = 4096
+        self._recall_min_scores: dict[str, float] | None = None
         # Default to observation-only recall. Observations are Hindsight's
         # consolidated knowledge layer — deduplicated, evidence-grounded
         # beliefs built from many raw facts, with proof counts and
@@ -1202,6 +1226,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
+            {"key": "recall_min_scores", "description": "Optional Hindsight recall score floors applied to both auto-recall and hindsight_recall (JSON object with semantic, keyword, reranker, or final values from 0 to 1)", "default": None},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
@@ -1702,6 +1727,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = self._config.get("auto_recall", True)
         self._recall_sync = bool(self._config.get("recall_sync", False))
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
+        self._recall_min_scores = _normalize_recall_min_scores(
+            self._config.get("recall_min_scores")
+        )
         # Default narrows recall to observation-only; pass an explicit
         # `recall_types` list in config.json to broaden (e.g. include
         # "world" / "experience") or to disable the filter entirely.
@@ -1852,6 +1880,23 @@ class HindsightMemoryProvider(MemoryProvider):
             return True
         return False
 
+    def _build_recall_kwargs(self, query: str) -> dict[str, Any]:
+        """Build the one recall contract shared by prefetch and the tool."""
+        recall_kwargs: dict[str, Any] = {
+            "bank_id": self._bank_id,
+            "query": query,
+            "budget": self._budget,
+            "max_tokens": self._recall_max_tokens,
+        }
+        if self._recall_tags:
+            recall_kwargs["tags"] = self._recall_tags
+            recall_kwargs["tags_match"] = self._recall_tags_match
+        if self._recall_types:
+            recall_kwargs["types"] = self._recall_types
+        if self._recall_min_scores:
+            recall_kwargs["min_scores"] = self._recall_min_scores
+        return recall_kwargs
+
     def _do_recall(self, query: str) -> _RecallResult:
         """Run one recall/reflect for *query*.
 
@@ -1870,15 +1915,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
                 # Reflect synthesizes across many memories -> no discrete count.
                 return _RecallResult(resp.text or "", 0)
-            recall_kwargs: dict = {
-                "bank_id": self._bank_id, "query": query,
-                "budget": self._budget, "max_tokens": self._recall_max_tokens,
-            }
-            if self._recall_tags:
-                recall_kwargs["tags"] = self._recall_tags
-                recall_kwargs["tags_match"] = self._recall_tags_match
-            if self._recall_types:
-                recall_kwargs["types"] = self._recall_types
+            recall_kwargs = self._build_recall_kwargs(query)
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -2203,15 +2240,7 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
-                recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                    "max_tokens": self._recall_max_tokens,
-                }
-                if self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
-                    recall_kwargs["types"] = self._recall_types
+                recall_kwargs = self._build_recall_kwargs(query)
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
