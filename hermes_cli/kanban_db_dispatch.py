@@ -1122,6 +1122,7 @@ def _record_task_failure(
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
+    expected_run_id: Optional[int] = None,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
@@ -1146,6 +1147,10 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        if expected_run_id is not None and row["current_run_id"] != expected_run_id:
+            return False
+        if end_run and (row["status"] != "running" or row["current_run_id"] is None):
+            return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -1159,6 +1164,29 @@ def _record_task_failure(
             effective_limit, limit_source = int(task_override), "task"
         else:
             effective_limit, limit_source = int(failure_limit), "dispatcher"
+
+        tripped = force_trip or failures >= effective_limit
+        disposition = "blocked" if tripped else retry_status
+        payload = {"error": error, "failures": failures, "retry_status": disposition}
+        if event_payload_extra:
+            payload.update(event_payload_extra)
+        payload["retry_status"] = disposition
+        # Resume phase is distinct from the actual queued disposition. Human
+        # unblocking must restore review even when the breaker stopped retries.
+        payload["resume_status"] = retry_status
+        if tripped:
+            payload.update(effective_limit=effective_limit, limit_source=limit_source,
+                           trigger_outcome=outcome)
+        run_id = None
+        if end_run:
+            # Close before accounting/event append, in the same transaction.
+            # A lost CAS must not spend a retry or announce a stale timeout.
+            run_id = _kb._end_run(
+                conn, task_id, outcome="gave_up" if tripped else outcome,
+                error=error, metadata=payload, expected_run_id=expected_run_id,
+            )
+            if run_id is None:
+                return False
 
         if not (force_trip or failures >= effective_limit):
             if release_claim:
@@ -1178,13 +1206,8 @@ def _record_task_failure(
                 )
             # Timeout/crash path's caller already emitted its own event.
             if end_run:
-                run_id = _kb._end_run(
-                    conn, task_id, outcome=outcome, status=outcome, error=error,
-                    metadata={"failures": failures, "retry_status": retry_status},
-                )
                 _kb._append_event(
-                    conn, task_id, outcome,
-                    {"error": error, "failures": failures, "retry_status": retry_status},
+                    conn, task_id, outcome, payload,
                     run_id=run_id,
                 )
             return False
@@ -1199,29 +1222,14 @@ def _record_task_failure(
             "WHERE id = ? AND status IN ('running', 'ready', 'review')",
             (failures, error, task_id),
         )
-        payload = {
+        payload.update({
             "failures": failures,
             "effective_limit": effective_limit,
             "limit_source": limit_source,
             "error": error,
             "trigger_outcome": outcome,
-            "retry_status": retry_status,
-        }
-        run_id = None
-        if end_run:
-            # Only the spawn path has an open run to close.
-            run_id = _kb._end_run(
-                conn, task_id, outcome="gave_up", status="gave_up", error=error,
-                metadata={
-                    "failures": failures,
-                    "trigger_outcome": outcome,
-                    "effective_limit": effective_limit,
-                    "limit_source": limit_source,
-                    "retry_status": retry_status,
-                },
-            )
-        if event_payload_extra:
-            payload.update(event_payload_extra)
+            "retry_status": "blocked",
+        })
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
         return True
 
@@ -2321,6 +2329,9 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    if task.max_iterations is not None:
+        # --max-turns belongs to chat, not the top-level parser.
+        cmd.extend(["--max-turns", str(int(task.max_iterations))])
     if task.goal_mode:
         # The kanban goal-loop hook only runs in cli.py's fully-quiet branch.
         # Without -Q the worker gets one turn, prints text, exits rc=0, and the

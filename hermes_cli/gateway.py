@@ -3039,6 +3039,9 @@ def _refuse_temp_home_service_write(definition: str, kind: str) -> bool:
 
 def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     """Rewrite the installed systemd unit when the generated definition has changed."""
+    if os.environ.get("HERMES_REEMXY_MANAGED_SYSTEMD_UNIT") == "1":
+        return False
+
     unit_path = get_systemd_unit_path(system=system)
     if not unit_path.exists():
         return False

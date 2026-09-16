@@ -532,3 +532,12 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+def test_finish_execution_persists_delivery_outcome_once(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("delivery", source="builtin")
+    executions.mark_execution_running(record["id"])
+    finished = executions.finish_execution(record["id"], success=True, delivery_outcome="delivered")
+    assert finished["delivery_outcome"] == "delivered"
+    assert executions.finish_execution(record["id"], success=False, delivery_outcome="failed") is None

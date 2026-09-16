@@ -396,6 +396,12 @@ class CompressionCommitFence:
         self._lock_release_guard = threading.Lock()
         self._cancelled_lock_release: Optional[Callable[[], None]] = None
         self._cancelled_lock_release_requested = False
+        # Recovery probe ownership is separate from the compression lock. A
+        # cancelled half-open attempt must release its token-qualified probe
+        # too, or a 900-second abandoned lease suppresses every retry.
+        self._probe_release_guard = threading.Lock()
+        self._cancelled_probe_release: Optional[Callable[[], None]] = None
+        self._cancelled_probe_release_requested = False
         # Touched per streamed token so waiters tell SLOW-but-alive from HUNG (no fixed wall-clock kill).
         self._last_progress = time.monotonic()
         self._progress_observed = False
@@ -570,11 +576,42 @@ class CompressionCommitFence:
 
     def release_cancelled_compression_lock(self) -> None:
         """After cancellation won: release the worker's lock (a request ahead of hook publication is retained)."""
+        # The probe is independent from the lock. A still-running worker may
+        # retain its lock to prevent overlap, but it has already lost commit
+        # admission and must not monopolize the one recovery probe.
+        self.release_cancelled_recovery_probe()
         if self._retain_cancelled_lock_until_worker_done:
             return
         with self._lock_release_guard:
             self._cancelled_lock_release_requested = True
             release = self._cancelled_lock_release
+        if release is not None:
+            release()
+
+    def register_cancelled_recovery_probe_release(self, release: Callable[[], None]) -> bool:
+        """Publish the token-qualified probe release hook for pre-commit cancellation."""
+        with self._probe_release_guard:
+            self._cancelled_probe_release = release
+            requested = self._cancelled_probe_release_requested
+        if requested:
+            release()
+        return requested
+
+    def clear_cancelled_recovery_probe_release(self, release: Callable[[], None]) -> None:
+        with self._probe_release_guard:
+            if self._cancelled_probe_release is release:
+                self._cancelled_probe_release = None
+
+    def release_cancelled_recovery_probe(self) -> None:
+        """Run a published probe release, retaining a pre-publication request."""
+        # A commit that was already admitted owns a completed side effect. Its
+        # probe must survive ordinary lock cleanup; only a revoked admission
+        # is a cancellation path that may release it after commit exits.
+        if self._commit_phase.is_set() and not self._admission_revoked:
+            return
+        with self._probe_release_guard:
+            self._cancelled_probe_release_requested = True
+            release = self._cancelled_probe_release
         if release is not None:
             release()
 
@@ -1161,7 +1198,12 @@ def _lock_api_is_absent_on_session_db(lock_db: Any) -> bool:
 
 def _refresh_persisted_compression_guards(compressor: Any, *, include_cooldown: bool = True) -> None:
     """Refresh durable automatic-compression guards on a built-in compressor."""
-    method_calls = [("_load_fallback_compression_streak", {}), ("_load_ineffective_compression_count", {})]
+    owned_probe_token = (
+        getattr(compressor, "_anti_thrash_probe_token", "")
+        if getattr(compressor, "_owns_anti_thrash_probe", False)
+        else ""
+    )
+    method_calls = [("_load_anti_thrash_breaker_state", {})]
     if include_cooldown:
         method_calls.insert(0, ("get_active_compression_failure_cooldown", {"refresh": True}))
     for method_name, kwargs in method_calls:
@@ -1169,7 +1211,21 @@ def _refresh_persisted_compression_guards(compressor: Any, *, include_cooldown: 
         if not callable(method):
             continue
         try:
-            method(compressor, **kwargs)
+            loaded = method(compressor, **kwargs)
+            if (
+                method_name == "_load_anti_thrash_breaker_state"
+                and owned_probe_token
+                and getattr(compressor, "_anti_thrash_probe_token", "") == owned_probe_token
+            ):
+                # A durable refresh must not erase the winner's local claim.
+                # A replacement token stays fenced: the subsequent gate
+                # validation rejects this owner rather than restoring it.
+                compressor._owns_anti_thrash_probe = True
+            if method_name == "_load_anti_thrash_breaker_state" and loaded is False:
+                for legacy in ("_load_fallback_compression_streak", "_load_ineffective_compression_count"):
+                    fallback = getattr(type(compressor), legacy, None)
+                    if callable(fallback):
+                        fallback(compressor)
         except Exception as exc:
             logger.debug("compression guard refresh failed (%s): %s", method_name, exc)
 
@@ -3611,6 +3667,16 @@ def compress_context(
     if not force and _automatic_compression_gate_blocks(agent, bypass_cooldown):
         return messages, _existing_system_prompt(agent, system_message)
 
+    # A successful half-open claim belongs to this attempt, before it takes
+    # the compression lock or dispatches a provider request. Publish the
+    # token-qualified release immediately so a host-side cancel cannot strand
+    # the probe for the full recovery lease.
+    _release_probe = None
+    if commit_fence is not None and getattr(agent.context_compressor, "_owns_anti_thrash_probe", False):
+        _release_probe = getattr(agent.context_compressor, "release_anti_thrash_recovery_probe", None)
+        if callable(_release_probe):
+            commit_fence.register_cancelled_recovery_probe_release(_release_probe)
+
     _pre_msg_count = len(messages)
     # In-place keeps the SAME session_id (no rotation/child/renumber/re-sync). A
     # missing attribute must default True, not rotation, which can wedge sessions.
@@ -3754,8 +3820,11 @@ def compress_context(
         try:
             lease.release()
         finally:
-            if _commit_fence_entered:
-                commit_fence.finish_commit()
+            if commit_fence is not None:
+                if _release_probe is not None:
+                    commit_fence.clear_cancelled_recovery_probe_release(_release_probe)
+                if _commit_fence_entered:
+                    commit_fence.finish_commit()
 
 
 def _codex_compaction_cooldown_remaining(agent: Any) -> float:

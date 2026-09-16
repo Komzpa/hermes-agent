@@ -638,7 +638,7 @@ class TestStdinHelpers:
         proc.stdin.close.assert_called_once()
         assert result["status"] == "ok"
 
-    def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
+    def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path, monkeypatch):
         """PTY mode: writing data + sending EOF lets an EOF-driven child finish.
 
         Background non-PTY mode used to expose subprocess stdin via a pipe,
@@ -646,19 +646,28 @@ class TestStdinHelpers:
         lockout (#17959). For interactive stdin → PTY mode is now the only
         supported path.
         """
+        # ``spawn_local`` deliberately uses the user's login shell.  This test
+        # must not inherit a developer's shell startup hooks, and ``running``
+        # only means the PTY wrapper was registered, not that the child reached
+        # its stdin read.  Pin a quiet sh-family shell and wait for the child
+        # itself to announce readiness before sending input or EOF.
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         session = registry.spawn_local(
-            'python3 -c "import sys; print(sys.stdin.read().strip())"',
+            'python3 -c "import sys; print(\'READY\', flush=True); print(sys.stdin.read().strip(), flush=True)"',
             cwd=str(tmp_path),
             use_pty=True,
         )
 
         try:
-            # Wait for the PTY child to be up rather than sleeping blindly.
+            # Wait for the EOF-driven child, not merely its PTY wrapper.
             assert _wait_until(
-                lambda: registry.poll(session.id)["status"] == "running",
+                lambda: (
+                    (poll := registry.poll(session.id))["status"] == "running"
+                    and "READY" in poll["output_preview"]
+                ),
                 timeout=5.0,
                 interval=0.02,
-            ), "PTY session never reached running"
+            ), "PTY child never reached its stdin read"
             assert registry.submit_stdin(session.id, "hello")["status"] == "ok"
             assert registry.close_stdin(session.id)["status"] == "ok"
 
@@ -2531,9 +2540,70 @@ class TestSystemdCgroupIsolation:
         warning.assert_not_called()
         assert f"MemoryMax={123 * 1024 * 1024}" in argv
 
-    def test_worker_memory_limit_caps_oversized_local_guard_override(
-        self, monkeypatch
-    ):
+    def test_worker_memory_limit_scales_beyond_four_gib_on_large_host(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.delenv("TERMINAL_LOCAL_MEMORY_MAX_MB", raising=False)
+        monkeypatch.setattr(
+            pr.Path,
+            "read_text",
+            lambda self, **_kwargs: (
+                "0::/worker.slice"
+                if str(self) == "/proc/self/cgroup"
+                else "max"
+            ),
+        )
+        monkeypatch.setattr(
+            pr.os,
+            "sysconf",
+            lambda name: {"SC_PHYS_PAGES": 4 * 1024 * 1024, "SC_PAGE_SIZE": 4096}[name],
+        )
+
+        assert pr._worker_memory_max_bytes() == 8 * 1024 * 1024 * 1024
+
+    def test_worker_memory_limit_honors_enclosing_cgroup(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.delenv("TERMINAL_LOCAL_MEMORY_MAX_MB", raising=False)
+        monkeypatch.setattr(
+            pr.Path,
+            "read_text",
+            lambda self, **_kwargs: (
+                "0::/worker.slice"
+                if str(self) == "/proc/self/cgroup"
+                else str(6 * 1024 * 1024 * 1024)
+            ),
+        )
+        monkeypatch.setattr(
+            pr.os,
+            "sysconf",
+            lambda name: {"SC_PHYS_PAGES": 4 * 1024 * 1024, "SC_PAGE_SIZE": 4096}[name],
+        )
+
+        assert pr._worker_memory_max_bytes() == 6 * 1024 * 1024 * 1024
+
+    def test_worker_memory_limit_honors_explicit_lower_override(self, monkeypatch):
+        import tools.process_registry as pr
+
+        monkeypatch.setenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "1024")
+        monkeypatch.setattr(
+            pr.Path,
+            "read_text",
+            lambda self, **_kwargs: (
+                "0::/worker.slice"
+                if str(self) == "/proc/self/cgroup"
+                else str(6 * 1024 * 1024 * 1024)
+            ),
+        )
+        monkeypatch.setattr(
+            pr.os,
+            "sysconf",
+            lambda name: {"SC_PHYS_PAGES": 4 * 1024 * 1024, "SC_PAGE_SIZE": 4096}[name],
+        )
+
+        assert pr._worker_memory_max_bytes() == 1024 * 1024 * 1024
+
+    def test_worker_memory_limit_falls_back_when_no_resource_signals(self, monkeypatch):
         import tools.process_registry as pr
 
         monkeypatch.setenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "999999")

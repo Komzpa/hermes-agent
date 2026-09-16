@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__.rpartition(".")[0])
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+_MIN_CLIENT_VERSION = "0.8.4"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` on retained memories is OPT-IN (AGENTS.md forbids
@@ -126,3 +126,28 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
                        template, exc, fallback)
         return fallback
     return re.sub(r"([-_])\1+", r"\1", rendered).strip("-_") or fallback
+
+
+_VALID_RECALL_MIN_SCORE_KEYS = {"semantic", "keyword", "reranker", "final"}
+
+
+def _normalize_recall_min_scores(value: Any) -> dict[str, float] | None:
+    """Validate the request-stage floors supported by Hindsight recall."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("recall_min_scores must be a JSON object")
+
+    normalized: dict[str, float] = {}
+    for key, raw_score in value.items():
+        if key not in _VALID_RECALL_MIN_SCORE_KEYS:
+            allowed = ", ".join(sorted(_VALID_RECALL_MIN_SCORE_KEYS))
+            raise ValueError(f"unsupported recall_min_scores key {key!r}; expected one of: {allowed}")
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"recall_min_scores.{key} must be numeric") from exc
+        if not 0.0 <= score <= 1.0:
+            raise ValueError(f"recall_min_scores.{key} must be between 0 and 1")
+        normalized[key] = score
+    return normalized or None

@@ -719,13 +719,8 @@ class TestRunJobSessionPersistence:
             yield fake_db, mock_agent_cls
 
 
-    def test_run_job_memory_enabled_in_cron(self, tmp_path):
-        """Cron agents get memory like any other agent run.
-
-        skip_memory=False and the memory toolset is not policy-denied, so
-        MEMORY.md/USER.md load and the memory tool follows normal toolset
-        resolution.
-        """
+    def test_run_job_memory_disabled_without_cron_opt_in(self, tmp_path):
+        """Cron memory stays off unless the profile explicitly opts in."""
         job = {
             "id": "memory-enabled-job",
             "name": "test",
@@ -735,13 +730,26 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is False
+        assert kwargs["skip_memory"] is True
         assert "memory" not in (kwargs["disabled_toolsets"] or []), (
             "memory toolset must not be policy-denied in cron"
         )
 
-    def test_run_job_keeps_per_job_memory_toolset(self, tmp_path):
-        """A per-job enabled_toolsets naming memory keeps it."""
+    def test_run_job_memory_enabled_by_cron_config(self, tmp_path):
+        """The profile-level cron.load_memory switch enables native memory."""
+        (tmp_path / "config.yaml").write_text("cron:\n  load_memory: true\n", encoding="utf-8")
+        job = {
+            "id": "memory-enabled-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        assert mock_agent_cls.call_args.kwargs["skip_memory"] is False
+
+    def test_run_job_keeps_per_job_memory_toolset_without_bypassing_gate(self, tmp_path):
+        """Toolset selection does not bypass the profile-level memory gate."""
         job = {
             "id": "memory-toolset-job",
             "name": "test",
@@ -752,7 +760,7 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is False
+        assert kwargs["skip_memory"] is True
         assert "memory" in (kwargs["enabled_toolsets"] or [])
         assert "file" in (kwargs["enabled_toolsets"] or [])
         assert "memory" not in kwargs["disabled_toolsets"]
@@ -1547,6 +1555,53 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
+    def test_forbidden_final_response_is_failed_and_suppressed(self):
+        job = {
+            **self._make_job(),
+            "forbidden_final_responses": ["HEARTBEAT_OK"],
+        }
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "HEARTBEAT_OK", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        deliver_mock.assert_not_called()
+        mark_mock.assert_called_once()
+        assert mark_mock.call_args.args[:3] == (
+            "monitor-job",
+            False,
+            "Forbidden final response 'HEARTBEAT_OK'; cron contract requires a user-facing message or an allowed suppression marker.",
+        )
+        assert mark_mock.call_args.kwargs["status"] == "forbidden_final_response"
+
+    def test_repeated_silent_responses_remain_successful(self):
+        job = {
+            **self._make_job(),
+            "max_consecutive_silences": 0,
+        }
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+            tick(verbose=False)
+
+        deliver_mock.assert_not_called()
+        assert mark_mock.call_count == 2
+        mark_mock.assert_called_with(
+            "monitor-job",
+            True,
+            None,
+            delivery_error=None,
+        )
+
     def test_silent_with_note_suppresses_delivery(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.claim_job_for_fire", return_value=True), \
@@ -1622,6 +1677,25 @@ class TestSilentDelivery:
             from cron.scheduler import tick
             tick(verbose=False)
         deliver_mock.assert_called_once()
+
+    def test_failed_job_stays_internal_when_failure_delivery_is_disabled(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
+             patch("cron.scheduler._cron_failure_delivery_enabled", return_value=False), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        deliver_mock.assert_not_called()
+        mark_mock.assert_called_once_with(
+            "monitor-job",
+            False,
+            "some error",
+            delivery_error=None,
+        )
 
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
@@ -1802,6 +1876,23 @@ class TestRunJobWakeGate:
         assert err is None
         assert final == SILENT_MARKER
         assert "Script gate returned `wakeAgent=false`" in doc
+        agent_cls.assert_not_called()
+
+    def test_failed_prerun_script_is_internal_when_failure_delivery_is_disabled(self):
+        """A private-profile collector crash never becomes an LLM-authored message."""
+        import cron.scheduler as scheduler
+        from cron import scheduler_script as sched_script
+
+        script_error = "Script exited with code 1\nstderr:\nselector crashed"
+        with patch.object(sched_script, "_run_job_script", return_value=(False, script_error)), \
+             patch.object(scheduler, "_cron_failure_delivery_enabled", return_value=False), \
+             patch("run_agent.AIAgent") as agent_cls:
+            success, doc, final, err = scheduler.run_job(self._make_job())
+
+        assert success is False
+        assert final == ""
+        assert err == script_error
+        assert "pre-run script failed" in doc
         agent_cls.assert_not_called()
 
     def test_wake_true_runs_agent_with_injected_output(self):
@@ -2973,3 +3064,25 @@ class TestFailureStreakNudge:
         from cron.scheduler import _failure_streak_nudge
         with patch("cron.scheduler.load_config", side_effect=RuntimeError("boom")):
             assert "failed 3 runs" in _failure_streak_nudge(self._job(2))
+
+
+def test_script_execution_id_is_explicit_and_parent_value_is_not_inherited(tmp_path, monkeypatch):
+    """A pre-run collector is bound only to its scheduler-provided execution."""
+    from cron import scheduler_script as sched_script
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "capture.py").write_text(
+        "import os\nprint(os.environ.get(\"HERMES_CRON_EXECUTION_ID\", \"<unset>\"))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sched_script._sched, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_CRON_EXECUTION_ID", "stale-parent")
+
+    explicit_ok, explicit = sched_script._run_job_script(
+        "capture.py", execution_id="run-123"
+    )
+    missing_ok, missing = sched_script._run_job_script("capture.py")
+
+    assert explicit_ok and explicit == "run-123"
+    assert missing_ok and missing == "<unset>"

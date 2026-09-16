@@ -3846,7 +3846,7 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
 
         assert response.choices[0].message.content == "aux survived"
 
-    def test_handles_final_output_is_none_after_consumer(self):
+    def test_rejects_final_without_output_after_consumer(self):
         """Regression for #33368 — defense against ``final.output`` being ``None``.
 
         The event-driven consumer always sets ``final.output`` to a list, so this
@@ -3855,7 +3855,7 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
         future code path that wraps a different consumer) would crash on
         ``for item in getattr(final, "output", [])`` because ``getattr`` returns
         ``None`` (not the default) when the attribute exists but is ``None``.
-        Coerce with ``or []`` to handle this defensively.
+        Reject the unusable response with a provider error, not TypeError or success.
         """
         # Stream that returns no items but a terminal with output=None.
         # The consumer assembles an empty list. We then mock the consumer's
@@ -3896,10 +3896,8 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
             fake_client = SimpleNamespace(responses=FakeResponses())
             adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-            # Should not raise TypeError: 'NoneType' object is not iterable
-            response = adapter.create(messages=[{"role": "user", "content": "x"}])
-            assert response.choices[0].message.content is None
-            assert response.choices[0].finish_reason == "stop"
+            with pytest.raises(RuntimeError, match="Responses API returned no output items"):
+                adapter.create(messages=[{"role": "user", "content": "x"}])
         finally:
             codex_runtime._consume_codex_event_stream = original_consume
 

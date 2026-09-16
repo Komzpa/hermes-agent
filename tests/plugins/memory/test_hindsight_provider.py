@@ -263,6 +263,7 @@ class TestConfig:
         assert provider._auto_recall is True
         assert provider._retain_every_n_turns == 1
         assert provider._recall_max_tokens == 4096
+        assert provider._recall_min_scores is None
         assert provider._recall_max_input_chars == 800
         assert provider._tags is None
         assert provider._observation_scopes is None
@@ -299,6 +300,7 @@ class TestConfig:
             retain_context="custom-ctx",
             bank_retain_mission="Extract key facts",
             recall_max_tokens=2048,
+            recall_min_scores={"semantic": 0.45, "keyword": 0.5, "final": 0.6},
             recall_types=["world", "experience"],
             recall_prompt_preamble="Custom preamble:",
             recall_max_input_chars=500,
@@ -317,6 +319,11 @@ class TestConfig:
         assert p._retain_context == "custom-ctx"
         assert p._bank_retain_mission == "Extract key facts"
         assert p._recall_max_tokens == 2048
+        assert p._recall_min_scores == {
+            "semantic": 0.45,
+            "keyword": 0.5,
+            "final": 0.6,
+        }
         assert p._recall_types == ["world", "experience"]
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
@@ -444,6 +451,27 @@ class TestPostSetup:
 
 
 class TestToolHandlers:
+    def test_recall_min_scores_apply_to_tool_and_prefetch(self, provider_with_config):
+        floors = {"semantic": 0.45, "keyword": 0.5, "final": 0.6}
+        provider = provider_with_config(recall_min_scores=floors)
+
+        provider.handle_tool_call("hindsight_recall", {"query": "tool query"})
+        assert provider._client.arecall.call_args.kwargs["min_scores"] == floors
+
+        provider._client.arecall.reset_mock()
+        provider.queue_prefetch("prefetch query")
+        assert provider._prefetch_thread is not None
+        provider._prefetch_thread.join(timeout=5.0)
+        assert provider._client.arecall.call_args.kwargs["min_scores"] == floors
+
+    @pytest.mark.parametrize(
+        "value",
+        [{"unknown": 0.5}, {"final": 1.1}, {"semantic": "not-a-number"}],
+    )
+    def test_invalid_recall_min_scores_fail_closed(self, provider_with_config, value):
+        with pytest.raises(ValueError, match="recall_min_scores"):
+            provider_with_config(recall_min_scores=value)
+
     def test_retain_success(self, provider):
         result = json.loads(provider.handle_tool_call(
             "hindsight_retain", {"content": "user likes dark mode"}
@@ -792,6 +820,32 @@ class TestPrefetchServerRetainVisibility:
         provider._client = client
 
         assert provider._is_retain_op_complete("bank", "op-gone") is True
+
+    @pytest.mark.parametrize("status", ["completed", "not_found"])
+    def test_visibility_status_marks_retain_recall_visible(self, provider, status):
+        """The API may return not_found in-band after completing and evicting an op."""
+        client = _make_mock_client()
+        client.operations = MagicMock()
+        client.operations.get_operation_status = AsyncMock(
+            return_value=SimpleNamespace(status=status)
+        )
+        provider._client = client
+
+        assert provider._retain_op_visibility_state("bank", "op-1") == "visible"
+
+    @pytest.mark.parametrize("status", ["failed", "cancelled"])
+    def test_terminal_retain_failure_does_not_wait_for_visibility_timeout(
+        self, provider_with_config, status
+    ):
+        """Terminal failures are typed failures, never a stale pending op."""
+        p = provider_with_config(prefetch_retain_drain_timeout=0.3)
+        p._client = self._client_with_ops([status])
+        p.sync_turn("hello", "world")
+        p._retain_queue.join()
+
+        assert p._wait_for_retains_drained(0.3) is False
+        assert p._pending_retain_ops == set()
+        assert p._client.operations.get_operation_status.await_count == 1
 
     def test_transient_status_error_keeps_waiting(self, provider):
         """A transient status-check error means 'unknown', so keep waiting."""

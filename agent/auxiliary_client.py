@@ -1073,26 +1073,16 @@ def _scoped_key_env(name: str) -> str:
 
 
 # Codex Responses → chat.completions adapter, so aux consumers need no changes.
-def _parse_codex_final_response(final: Any) -> Tuple[List[str], List[Any], Any]:
-    """Split a completed Responses object into (text_parts, tool_calls, usage) in chat.completions shape."""
-    text_parts: List[str] = []
-    tool_calls_raw: List[Any] = []
-    for item in (getattr(final, "output", None) or []):
-        item_type = _field(item, "type")
-        if item_type == "message":
-            for part in (_field(item, "content") or []):
-                part_type = _field(part, "type")
-                if part_type in {"output_text", "text"}:
-                    text_parts.append(_field(part, "text", ""))
-                elif part_type == "refusal":
-                    # A refusal part carries the model's explanation; dropping it turns a
-                    # refusal-only turn into an empty response that gets retried.
-                    text_parts.append(_field(part, "refusal", ""))
-        elif item_type == "function_call":
-            tool_calls_raw.append(SimpleNamespace(
-                id=_field(item, "call_id", ""), type="function",
-                function=SimpleNamespace(
-                    name=_field(item, "name", ""), arguments=_field(item, "arguments", "{}"))))
+def _parse_codex_final_response(final: Any) -> Tuple[List[str], List[Any], Any, str]:
+    """Use the main Responses normalizer, preserving terminal failure and partial output."""
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    message, finish_reason = _normalize_codex_response(final)
+    text_parts = [message.content] if message.content else []
+    tool_calls_raw = message.tool_calls or []
+    # Auxiliary callers consume one complete result; a partial summary cannot be committed.
+    if getattr(final, "status", None) == "incomplete" or finish_reason == "incomplete":
+        finish_reason = "length"
     usage = None
     resp_usage = getattr(final, "usage", None)
     if resp_usage:
@@ -1101,7 +1091,7 @@ def _parse_codex_final_response(final: Any) -> Tuple[List[str], List[Any], Any]:
         usage = SimpleNamespace(
             prompt_tokens=_u("input_tokens"), completion_tokens=_u("output_tokens"),
             total_tokens=_u("total_tokens"))
-    return text_parts, tool_calls_raw, usage
+    return text_parts, tool_calls_raw, usage, finish_reason
 
 
 def _close_quietly(target: Any, failure_note: Optional[str]) -> None:
@@ -1512,7 +1502,7 @@ class _CodexCompletionsAdapter:
                 guard.release_stream(event_stream)
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
-            text_parts, tool_calls_raw, usage = _parse_codex_final_response(final)
+            text_parts, tool_calls_raw, usage, finish_reason = _parse_codex_final_response(final)
         except Exception as exc:
             if guard.timed_out.is_set():
                 raise TimeoutError(guard.timeout_message()) from exc
@@ -1526,7 +1516,7 @@ class _CodexCompletionsAdapter:
             tool_calls=tool_calls_raw or None,
         )
         choice = SimpleNamespace(
-            index=0, message=message, finish_reason="stop" if not tool_calls_raw else "tool_calls"
+            index=0, message=message, finish_reason=finish_reason
         )
         return SimpleNamespace(choices=[choice], model=model, usage=usage)
 
@@ -3958,6 +3948,25 @@ def _try_main_agent_model_fallback(
     so a hung aux model says nothing about the main model's health. Returns (client, model, label) or (None, None, "")."""
     main_provider = (_read_main_provider() or "").strip()
     main_model = (_read_main_model() or "").strip()
+    if main_provider.lower() == "custom":
+        try:
+            from hermes_cli.runtime_provider import (
+                _get_named_custom_provider,
+                canonical_custom_identity,
+            )
+
+            named_provider = canonical_custom_identity(
+                base_url=_read_main_base_url(), model=main_model
+            )
+            named_entry = (
+                _get_named_custom_provider(named_provider)
+                if named_provider
+                else None
+            )
+            if named_entry and named_entry.get("api_mode") == "codex_responses":
+                main_provider = named_provider
+        except Exception:
+            pass
     if main_provider.lower() == "moa":
         # MoA virtual provider: fall back to the preset's aggregator (the acting model).
         _agg_provider, _agg_model = _resolve_moa_aggregator(main_model)

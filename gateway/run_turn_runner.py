@@ -1609,7 +1609,8 @@ class TurnRunner:
                 # Internal self-injected turn: type the persisted user row so UIs render it as a
                 # timeline notice, not a user bubble (stripped from provider payloads downstream).
                 kwargs["persist_user_display_kind"] = ctx.persist_user_display_kind
-            if ctx.persist_user_display_metadata:
+            if ctx.persist_user_display_metadata and _accepts_keyword(
+                    agent.run_conversation, "persist_user_display_metadata"):
                 kwargs["persist_user_display_metadata"] = ctx.persist_user_display_metadata
             if ctx.moa_config is not None:
                 kwargs["moa_config"] = ctx.moa_config
@@ -1617,7 +1618,8 @@ class TurnRunner:
                 kwargs["persist_user_timestamp"] = persist_user_timestamp_override
             # The RAW inbound id (not event_message_id, the reply anchor) rides the persisted user
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
-            if ctx.inbound_message_id is not None:
+            if ctx.inbound_message_id is not None and _accepts_keyword(
+                    agent.run_conversation, "persist_user_platform_id"):
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             return agent.run_conversation(api_message, **kwargs)
         finally:

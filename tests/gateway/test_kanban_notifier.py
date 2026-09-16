@@ -12,6 +12,7 @@ from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 class RecordingAdapter:
@@ -315,8 +316,10 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     try:
         tid = kb.create_task(conn, title="cycle test", assignee="worker")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
-        # First crash — fired by the dispatcher when the worker PID dies.
-        kb._append_event(conn, tid, kind="crashed")
+        claimed = kb.claim_task(conn, tid, claimer="test:first")
+        kbd._record_task_failure(conn, tid, "Synthetic crash", outcome="crashed",
+                                 release_claim=True, end_run=True, failure_limit=3,
+                                 expected_run_id=claimed.current_run_id)
     finally:
         conn.close()
 
@@ -326,7 +329,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
 
     # First crash delivered.
     assert len(adapter.sent) == 1
-    assert "stopped unexpectedly" in adapter.sent[0]["text"].lower()
+    assert "worker crashed (pid gone)" in adapter.sent[0]["text"].lower()
 
     # Subscription survives — the cursor advanced past event #1, but the
     # row is still there.
@@ -338,10 +341,10 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
             "second crash also notifies the user (issue #21398)."
         )
 
-        # Second crash — same task, same dispatcher (or a respawn). Append
-        # another event to simulate the dispatcher firing crashed a second
-        # time during retry.
-        kb._append_event(conn, tid, kind="crashed")
+        claimed = kb.claim_task(conn, tid, claimer="test:second")
+        kbd._record_task_failure(conn, tid, "Synthetic crash", outcome="crashed",
+                                 release_claim=True, end_run=True, failure_limit=3,
+                                 expected_run_id=claimed.current_run_id)
     finally:
         conn.close()
 
@@ -354,7 +357,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"Second crashed event should also notify; got {len(adapter.sent)} "
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
-    assert "stopped unexpectedly" in adapter.sent[1]["text"].lower()
+    assert "worker crashed (pid gone)" in adapter.sent[1]["text"].lower()
 
 
 def test_notifier_subscription_survives_done_reopen_until_archive(
@@ -597,11 +600,10 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     try:
         tid = kb.create_task(conn, title="loops forever", assignee="worker")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
-        kb._append_event(
-            conn, tid, "block_loop_detected",
-            {"reason": "needs credentials", "kind": "needs_input",
-             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
-        )
+        for attempt in range(kb.BLOCK_RECURRENCE_LIMIT):
+            if attempt:
+                assert kb.unblock_task(conn, tid)
+            assert kb.block_task(conn, tid, reason="needs credentials", kind="needs_input")
     finally:
         conn.close()
 
@@ -768,11 +770,10 @@ def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
             chat_type="dm",
             delivery_mode="notify+wake",
         )
-        kb._append_event(
-            conn, tid, "block_loop_detected",
-            {"reason": "needs credentials", "kind": "needs_input",
-             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
-        )
+        for attempt in range(kb.BLOCK_RECURRENCE_LIMIT):
+            if attempt:
+                assert kb.unblock_task(conn, tid)
+            assert kb.block_task(conn, tid, reason="needs credentials", kind="needs_input")
     finally:
         conn.close()
 

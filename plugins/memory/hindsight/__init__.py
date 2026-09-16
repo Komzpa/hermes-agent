@@ -43,6 +43,7 @@ from .settings import (
     _DEFAULT_TIMEOUT, _HINDSIGHT_GLYPH, _MIN_CLIENT_VERSION, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
     _PROVIDER_DEFAULT_MODELS, _VALID_BUDGETS, _daemon_llm_provider,
     _normalize_observation_scopes, _normalize_retain_tags, _parse_int_setting,
+    _normalize_recall_min_scores,
     _resolve_bank_id_template,
 )
 
@@ -452,6 +453,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
+            {"key": "recall_min_scores", "description": "Optional recall score floors for auto-recall and hindsight_recall (semantic, keyword, reranker, or final; 0 to 1)", "default": None},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
@@ -576,21 +578,45 @@ class HindsightMemoryProvider(MemoryProvider):
             with self._pending_retain_ops_lock:
                 self._pending_retain_ops.update(ids)
 
-    def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
-        """True when a server-side retain op is done or gone (completed ops are evicted,
-        so 404 = no longer pending). Transient errors -> False, caller keeps waiting."""
+    def _retain_op_visibility_state(self, bank_id: str, op_id: str) -> str:
+        """Return the terminal visibility state for one async retain operation.
+
+        A completed operation (or an HTTP 404 after server-side eviction) is
+        recall-visible. ``failed`` and ``cancelled`` are terminal, but must not
+        be confused with a visible write; a status payload may also report
+        ``not_found`` instead of returning HTTP 404 for an already-evicted
+        completed operation. Transient status-check errors remain pending so
+        the bounded caller can retry until its deadline.
+        """
         from hindsight_client_api.exceptions import NotFoundException
 
         try:
             resp = self._run_hindsight_operation(
-                lambda client: client.operations.get_operation_status(bank_id=bank_id, operation_id=op_id)
+                lambda client: client.operations.get_operation_status(
+                    bank_id=bank_id, operation_id=op_id
+                )
             )
         except NotFoundException:
-            return True
+            return "visible"
         except Exception as exc:
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
-            return False
-        return str(getattr(resp, "status", "") or "").lower() in {"completed", "failed"}
+            return "pending"
+        status = str(getattr(resp, "status", "") or "").lower()
+        if status in {"completed", "not_found"}:
+            return "visible"
+        if status in {"failed", "cancelled"}:
+            logger.warning(
+                "Prefetch: retain operation %s reached terminal %s state; "
+                "its write is not recall-visible",
+                op_id,
+                status,
+            )
+            return "failed"
+        return "pending"
+
+    def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
+        """Compatibility helper for callers that only need a terminal state."""
+        return self._retain_op_visibility_state(bank_id, op_id) != "pending"
 
     def _wait_for_retains_drained(self, timeout: float) -> bool:
         """Block up to *timeout* s for the last retain to become recall-visible
@@ -626,13 +652,21 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._shutting_down.is_set():
                 return False
             done: set[str] = set()
+            failed: set[str] = set()
             for op_id in pending:
                 if self._shutting_down.is_set():
                     return False
                 if _expired():
                     break
-                if self._is_retain_op_complete(bank_id, op_id):
+                state = self._retain_op_visibility_state(bank_id, op_id)
+                if state == "visible":
                     done.add(op_id)
+                elif state == "failed":
+                    failed.add(op_id)
+            if failed:
+                with self._pending_retain_ops_lock:
+                    self._pending_retain_ops.difference_update(done | failed)
+                return False
             with self._pending_retain_ops_lock:
                 self._pending_retain_ops.difference_update(done)
                 if not self._pending_retain_ops:
@@ -786,6 +820,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = cfg.get("auto_recall", True)
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
+        self._recall_min_scores = _normalize_recall_min_scores(cfg.get("recall_min_scores"))
         self._recall_max_input_chars = int(cfg.get("recall_max_input_chars", 800))
         # None -> observation-only (Hindsight's consolidated, deduplicated layer; raw
         # world/experience facts re-ship the evidence they summarize and burn the
@@ -881,6 +916,8 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
+        if self._recall_min_scores:
+            kwargs["min_scores"] = self._recall_min_scores
         resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
         return resp.results or []
 

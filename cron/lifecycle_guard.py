@@ -52,8 +52,15 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # (tools/approval.py, skipped on force=True) as the only cover, while this hard block — documented as
     # "force=True cannot help here" — let them through (#80260).
     r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap|bootout|remove|disable)\b[^\n]*\bhermes[.\-]?gateway)"
-    # Branch C: systemctl ops on a hermes-gateway unit.
-    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
+    # Branch C: systemctl lifecycle ops on either private-brain gateway.
+    # `disable --now` must be covered: it stopped and disabled the live Reemxy
+    # gateway from inside its own turn.  The sibling OpenClaw gateway is also
+    # protected so an agent cannot create overlapping Telegram pollers.
+    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start|kill|enable|disable|reenable|mask|unmask|preset)\b[^\n]*\b(?:hermes|openclaw)[.\-]?gateway)"
+    # An updater is an indirect gateway restart path.  It is owned by the
+    # separate host timer, never callable from a gateway turn.
+    r"|(?:\b(?:python3?|uv)\b[^\n]*\bupdate_reemxy_hermes\.py\b)"
+    r"|(?:\bsystemctl\b[^\n]*\bhermes[.\-]?reemxy[.\-]?updater\b)"
     # Branch D: pkill/kill of the gateway process, both token orders. Leading \b keeps "skill" from
     # matching as "kill".
     r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"

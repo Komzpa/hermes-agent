@@ -8,7 +8,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+from agent.agent_init import _load_tools
+from agent.prompt_builder import KANBAN_GUIDANCE, kanban_worker_guidance
+from agent.system_prompt import _tool_guidance_block, build_system_prompt, build_system_prompt_parts
 
 
 def _make_agent(**overrides):
@@ -35,6 +37,75 @@ def _make_agent(**overrides):
     )
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_board_capable_session_without_task_has_no_worker_lifecycle(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    assert kanban_worker_guidance({"kanban_show", "kanban_create"}) == ""
+
+
+def test_dispatched_worker_with_kanban_tools_keeps_lifecycle(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+
+    assert kanban_worker_guidance({"kanban_show", "kanban_complete"}) == KANBAN_GUIDANCE
+
+
+def test_no_kanban_tool_mode_is_unchanged(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+
+    assert kanban_worker_guidance({"memory"}) == ""
+
+
+def test_init_path_uses_the_same_dispatched_worker_rule(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions",
+        lambda **_kwargs: [{"function": {"name": "kanban_show"}}],
+    )
+    agent = SimpleNamespace(quiet_mode=True)
+
+    _load_tools(agent, enabled_toolsets=None, disabled_toolsets=None)
+
+    assert agent.valid_tool_names == {"kanban_show"}
+    assert agent._kanban_worker_guidance == ""
+
+
+def test_init_path_keeps_lifecycle_for_a_dispatched_worker(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions",
+        lambda **_kwargs: [{"function": {"name": "kanban_show"}}],
+    )
+    agent = SimpleNamespace(quiet_mode=True)
+
+    _load_tools(agent, enabled_toolsets=None, disabled_toolsets=None)
+
+    assert agent._kanban_worker_guidance == KANBAN_GUIDANCE
+
+
+def test_fallback_path_uses_the_same_dispatched_worker_rule(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    agent = SimpleNamespace(
+        valid_tool_names={"kanban_show"},
+        _memory_enabled=False,
+        _user_profile_enabled=False,
+    )
+
+    assert KANBAN_GUIDANCE not in (_tool_guidance_block(agent) or "")
+
+
+def test_fallback_path_keeps_lifecycle_for_a_dispatched_worker(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    agent = SimpleNamespace(
+        valid_tool_names={"kanban_show"},
+        _memory_enabled=False,
+        _user_profile_enabled=False,
+    )
+
+    assert KANBAN_GUIDANCE in (_tool_guidance_block(agent) or "")
 
 
 def _captured_context_cwd(agent):
@@ -834,4 +905,3 @@ class TestConversationStartedTwoLine:
         vol = self._volatile(agent)
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
-
