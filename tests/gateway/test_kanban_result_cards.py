@@ -184,7 +184,8 @@ def test_approval_block_still_delivers_without_ingest(tmp_path, monkeypatch, rec
 
 
 @pytest.mark.parametrize("explicit", [True, False])
-def test_artifact_result_preserves_file_without_text_only_card(tmp_path, monkeypatch, receiver, explicit):
+def test_artifact_result_cuts_over_with_files(tmp_path, monkeypatch, receiver, explicit):
+    import base64
     artifact = tmp_path / "comparison.csv"
     content = b"option,latency_ms\nB,4\n"
     artifact.write_bytes(content)
@@ -195,6 +196,50 @@ def test_artifact_result_preserves_file_without_text_only_card(tmp_path, monkeyp
              artifacts=[str(artifact)] if explicit else None)
     adapter = Adapter()
     tick(monkeypatch, adapter)
+    receipts, cards, _ = receiver
+    assert adapter.sent == []
+    assert adapter.documents == []
+    assert len(cards) == 1
+    posted = receipts[0][2]
+    assert len(posted["files"]) == 1
+    assert posted["files"][0]["name"] == "comparison.csv"
+    assert base64.b64decode(posted["files"][0]["data"]) == content
+
+
+def test_missing_artifact_preserves_telegram(tmp_path, monkeypatch, receiver):
+    complete(tmp_path, monkeypatch, {"output_kind": "research_result"},
+             "Option B won the comparison.",
+             artifacts=[str(tmp_path / "gone.csv")])
+    adapter = Adapter()
+    tick(monkeypatch, adapter)
     assert receiver[0] == []
     assert len(adapter.sent) == 1
+
+
+def test_oversize_artifact_preserves_telegram(tmp_path, monkeypatch, receiver, monkeypatch2=None):
+    import gateway.kanban_watchers as kw
+    artifact = tmp_path / "big.bin"
+    artifact.write_bytes(b"x" * 32)
+    summary = "Option B won the comparison."
+    complete(tmp_path, monkeypatch, {"output_kind": "research_result"}, summary,
+             artifacts=[str(artifact)])
+    monkeypatch.setattr(kw, "_RESULT_CARD_MAX_BYTES", 4)
+    adapter = Adapter()
+    tick(monkeypatch, adapter)
+    assert receiver[0] == []
+    assert len(adapter.sent) == 1
+    assert adapter.documents == [b"x" * 32]
+
+
+def test_artifact_non204_preserves_telegram_upload(tmp_path, monkeypatch, receiver):
+    artifact = tmp_path / "comparison.csv"
+    content = b"option,latency_ms\nB,4\n"
+    artifact.write_bytes(content)
+    complete(tmp_path, monkeypatch, {"output_kind": "research_result"},
+             "Option B won the comparison.", artifacts=[str(artifact)])
+    receiver[2]["status"] = 500
+    adapter = Adapter()
+    tick(monkeypatch, adapter)
+    assert len(adapter.sent) == 1
     assert adapter.documents == [content]
+    assert receiver[1] == {}

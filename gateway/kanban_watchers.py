@@ -211,6 +211,90 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     return None
 
 
+_RESULT_CARD_MAX_FILES = 10
+_RESULT_CARD_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _collect_kanban_artifact_paths(event_payload, task_result=None):
+    """Single source for completion artifact paths (Telegram + result cards)."""
+    import os as _os
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(path: str) -> None:
+        if not path:
+            return
+        expanded = _os.path.expanduser(path)
+        if expanded in seen:
+            return
+        if not _os.path.isfile(expanded):
+            return
+        seen.add(expanded)
+        candidates.append(expanded)
+
+    # 1. Explicit artifacts list in payload.
+    if isinstance(event_payload, dict):
+        raw = event_payload.get("artifacts")
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                if isinstance(item, str):
+                    _add(item)
+
+        # 2. Paths embedded in the payload summary.
+        summary = event_payload.get("summary")
+        if isinstance(summary, str) and summary:
+            from gateway.platforms.base import BasePlatformAdapter
+
+            paths, _ = BasePlatformAdapter.extract_local_files(summary)
+            for p in paths:
+                _add(p)
+
+    # 3. Legacy: paths embedded in task.result.
+    if task_result:
+        from gateway.platforms.base import BasePlatformAdapter
+
+        paths, _ = BasePlatformAdapter.extract_local_files(str(task_result))
+        for p in paths:
+            _add(p)
+
+    if not candidates:
+        return []
+    from gateway.platforms.base import BasePlatformAdapter
+
+    return BasePlatformAdapter.filter_local_delivery_paths(candidates)
+
+
+def _encode_result_card_files(paths):
+    """Read paths into ingest ``files`` entries; None when unsafe/oversize."""
+    import base64 as _b64
+    import mimetypes as _mime
+
+    if len(paths) > _RESULT_CARD_MAX_FILES:
+        return None
+    total = 0
+    entries = []
+    for path in paths:
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return None
+        total += len(data)
+        if total > _RESULT_CARD_MAX_BYTES:
+            return None
+        name = Path(path).name
+        media_type = _mime.guess_type(name)[0] or "application/octet-stream"
+        entries.append(
+            {
+                "name": name,
+                "media_type": media_type,
+                "data": _b64.b64encode(data).decode("ascii"),
+            }
+        )
+    return entries
+
+
 def _completed_result_card(task, event, run, board):
     """Only explicitly classified research/brief handoffs belong in the inbox."""
     metadata = run.metadata if run and isinstance(run.metadata, dict) else {}
@@ -223,17 +307,20 @@ def _completed_result_card(task, event, run, board):
         return None
     if metadata.get("urgent") or metadata.get("approval_required"):
         return None
-    # The receiver's strict Card schema has no attachment storage/download
-    # contract. Do not accept a text-only receipt that would discard files.
-    if metadata.get("artifacts") or event.payload.get("artifacts"):
+    candidates = _collect_kanban_artifact_paths(
+        event.payload if isinstance(getattr(event, "payload", None), dict) else {},
+        task.result if task else None,
+    )
+    raw_explicit = metadata.get("artifacts") or (event.payload or {}).get("artifacts")
+    if raw_explicit and not candidates:
+        # Explicitly referenced file that cannot be delivered — keep Telegram.
         return None
-    from gateway.platforms.base import BasePlatformAdapter
-
-    for text in (summary, (event.payload or {}).get("summary", ""), task.result if task else ""):
-        paths, _ = BasePlatformAdapter.extract_local_files(text or "")
-        if paths:
+    files = None
+    if candidates:
+        files = _encode_result_card_files(candidates)
+        if files is None:
             return None
-    return {
+    card = {
         "external_id": f"kanban:{board or 'default'}:{event.task_id}:result:{event.id}",
         "kind": kind,
         "title": title,
@@ -241,6 +328,9 @@ def _completed_result_card(task, event, run, board):
         "at": datetime.fromtimestamp(event.created_at, timezone.utc).isoformat(),
         "timed": False,
     }
+    if files:
+        card["files"] = files
+    return card
 
 
 class _NoIngestRedirect(HTTPRedirectHandler):
@@ -1270,49 +1360,13 @@ class GatewayKanbanWatchersMixin:
         """
         from pathlib import Path as _Path
 
-        candidates: list[str] = []
-        seen: set[str] = set()
-
-        def _add(path: str) -> None:
-            if not path:
-                return
-            expanded = os.path.expanduser(path)
-            if expanded in seen:
-                return
-            if not os.path.isfile(expanded):
-                return
-            seen.add(expanded)
-            candidates.append(expanded)
-
-        # 1. Explicit artifacts list in payload.
-        if isinstance(event_payload, dict):
-            raw = event_payload.get("artifacts")
-            if isinstance(raw, (list, tuple)):
-                for item in raw:
-                    if isinstance(item, str):
-                        _add(item)
-
-            # 2. Paths embedded in the payload summary.
-            summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
-                paths, _ = adapter.extract_local_files(summary)
-                for p in paths:
-                    _add(p)
-
-        # 3. Legacy: paths embedded in task.result.
-        if task is not None and getattr(task, "result", None):
-            result_text = str(task.result)
-            paths, _ = adapter.extract_local_files(result_text)
-            for p in paths:
-                _add(p)
-
+        candidates = _collect_kanban_artifact_paths(
+            event_payload,
+            getattr(task, "result", None) if task is not None else None,
+        )
         if not candidates:
             return
 
-        from gateway.platforms.base import BasePlatformAdapter
-        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
-        if not candidates:
-            return
 
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}

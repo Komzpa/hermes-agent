@@ -86,13 +86,14 @@ a new completion event is a new result version. Use a source token scoped to
 this producer/board namespace, not shared by independent Hermes installations.
 
 Only the canonical ingest HTTP **204** receipt suppresses the matching ordinary
-Telegram text result. Artifact-bearing results currently **do not cut over**:
-the receiver's strict ingest `Card` contract has no attachment storage/download
-field or route. Explicit files and files discovered in completion prose keep
-their existing Telegram text and native uploads, with no text-only duplicate
-card. This prevents data loss but is **partial R26/R27 implementation**, not
-attachment-card acceptance. The receiver needs persisted authenticated file
-storage/download and client offline caching before these results can cut over.
+Telegram text result. Artifact-bearing results cut over with their bytes: the
+producer collects explicit `artifacts` plus files discovered in completion prose
+through one shared helper (the same source Telegram uploads use), reads up to 10
+files / 8 MiB total, and posts them as ingest `files[{name, media_type, data
+base64}]`. A 204 then suppresses both the Telegram text and the native uploads,
+so no duplicate lands in chat. An unreadable/missing file, an over-limit batch,
+or any non-204 answer keeps existing Telegram text and native uploads; nothing
+is silently discarded.
 Missing configuration, timeout, rejection, unexpected responses and transport
 failure retain existing Telegram delivery and its send-failure rewind/drop
 policy. Redirects are not followed. A lost receipt may leave a card plus a
