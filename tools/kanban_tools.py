@@ -741,6 +741,12 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    output_kind = args.get("output_kind")
+    if output_kind is not None:
+        if output_kind not in ("research_result", "proactive_brief", "other"):
+            return tool_error("output_kind must be research_result, proactive_brief, or other")
+        metadata = dict(metadata or {})
+        metadata["output_kind"] = output_kind
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -1786,6 +1792,18 @@ KANBAN_COMPLETE_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "output_kind": {
+                "type": "string",
+                "enum": ["research_result", "proactive_brief", "other"],
+                "description": (
+                    "Classify the delivered result by meaning: research_result for "
+                    "completed research findings; proactive_brief for an unsolicited "
+                    "substantive briefing; other for implementation, orchestration, "
+                    "acknowledgements or process updates. Research and briefs must "
+                    "include their full readable result in summary, not just a status. "
+                    "Set metadata.urgent or metadata.approval_required when applicable."
+                ),
             },
             "summary": {
                 "type": "string",

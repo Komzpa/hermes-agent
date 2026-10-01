@@ -11,12 +11,15 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import sqlite3
 import time
 from contextvars import Context
+from datetime import datetime, timezone
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -206,6 +209,66 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
         if resolved:
             return str(resolved)
     return None
+
+
+def _completed_result_card(task, event, run, board):
+    """Only explicitly classified research/brief handoffs belong in the inbox."""
+    metadata = run.metadata if run and isinstance(run.metadata, dict) else {}
+    kind = metadata.get("output_kind")
+    if kind not in ("research_result", "proactive_brief"):
+        return None
+    summary = (run.summary if run else None) or (task.result if task else None) or ""
+    title = task.title.strip() if task else event.task_id
+    if not summary.strip() or summary.strip().casefold() == title.casefold():
+        return None
+    if metadata.get("urgent") or metadata.get("approval_required"):
+        return None
+    # The receiver's strict Card schema has no attachment storage/download
+    # contract. Do not accept a text-only receipt that would discard files.
+    if metadata.get("artifacts") or event.payload.get("artifacts"):
+        return None
+    from gateway.platforms.base import BasePlatformAdapter
+
+    for text in (summary, (event.payload or {}).get("summary", ""), task.result if task else ""):
+        paths, _ = BasePlatformAdapter.extract_local_files(text or "")
+        if paths:
+            return None
+    return {
+        "external_id": f"kanban:{board or 'default'}:{event.task_id}:result:{event.id}",
+        "kind": kind,
+        "title": title,
+        "summary": summary,
+        "at": datetime.fromtimestamp(event.created_at, timezone.utc).isoformat(),
+        "timed": False,
+    }
+
+
+class _NoIngestRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _ingest_result_card(card):
+    """A canonical 204 is the receipt; anything else retains Telegram delivery."""
+    from hermes_cli.config import load_config
+
+    try:
+        settings = ((load_config() or {}).get("kanban") or {}).get("result_cards") or {}
+        endpoint = settings.get("ingest_url")
+        token = os.environ.get("LITTERBOX_SOURCE_TOKEN")
+        if not endpoint or not token:
+            return False
+        request = Request(
+            endpoint,
+            data=json.dumps(card, ensure_ascii=False).encode("utf-8"),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with build_opener(_NoIngestRedirect()).open(request, timeout=10) as response:
+            return response.status == 204
+    except Exception:
+        logger.warning("kanban result card ingest failed; retaining Telegram delivery")
+        return False
 
 
 class GatewayKanbanWatchersMixin:
@@ -489,6 +552,13 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    result_cards = {}
+                                    for event in events:
+                                        if event.kind == "completed":
+                                            run = _kb.get_run(conn, event.run_id) if event.run_id else None
+                                            card = _completed_result_card(task, event, run, slug)
+                                            if card:
+                                                result_cards[event.id] = card
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -500,6 +570,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "result_cards": result_cards,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -738,6 +809,16 @@ class GatewayKanbanWatchersMixin:
                             # below is the sole delivery — the failure counter
                             # is resolved (reset or bumped) by the wake
                             # outcome there, not by skipping the send here.
+                            continue
+                        card = d["result_cards"].get(ev.id)
+                        if (
+                            card and platform_str == "telegram"
+                            and (not sub_profile or sub_profile == notifier_profile)
+                            and await _to_thread_process_service(_ingest_result_card, card)
+                        ):
+                            # Skip only this ordinary result's text/attachments.
+                            # The creator wake and every other event retain their semantics.
+                            sub_fail_counts.pop(sub_key, None)
                             continue
                         try:
                             _send_res = await adapter.send(

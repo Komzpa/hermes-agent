@@ -2870,6 +2870,8 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Receipt-gated ordinary research/brief delivery; empty disables cutover.
+        "result_cards": {"ingest_url": ""},
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The
@@ -4066,6 +4068,14 @@ DEFAULT_CONFIG = {
 
 # Optional environment variables that enhance functionality
 OPTIONAL_ENV_VARS = {
+    "LITTERBOX_SOURCE_TOKEN": {
+        "description": "Litterbox tenant/source-scoped ingest token for result cards",
+        "prompt": "Litterbox source token",
+        "url": None,
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
     # ── Provider (handled in provider selection, not shown in checklists) ──
     "NOUS_BASE_URL": {
         "description": "Nous Portal base URL override",
