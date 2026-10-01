@@ -122,6 +122,18 @@ KANBAN_COMPLETE_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "output_kind": {
+            "type": "string",
+            "enum": ["research_result", "proactive_brief", "other"],
+            "description": (
+                "Classify the delivered result by meaning: research_result for "
+                "completed research findings; proactive_brief for an unsolicited "
+                "substantive briefing; other for implementation, orchestration, "
+                "acknowledgements or process updates. Research and briefs must "
+                "include their full readable result in summary, not just a status. "
+                "Set metadata.urgent or metadata.approval_required when applicable."
+            ),
+        },
         "summary": _prop("string", (
                 "Human-readable handoff, 1-3 sentences. Appears in "
                 "Run History on the dashboard and in downstream "
