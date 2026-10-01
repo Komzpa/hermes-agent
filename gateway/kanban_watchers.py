@@ -19,7 +19,6 @@ import sqlite3
 import time
 from contextvars import Context
 from datetime import datetime, timezone
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -333,32 +332,7 @@ def _completed_result_card(task, event, run, board):
     return card
 
 
-class _NoIngestRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
 
-
-def _ingest_result_card(card):
-    """A canonical 204 is the receipt; anything else retains Telegram delivery."""
-    from hermes_cli.config import load_config
-
-    try:
-        settings = ((load_config() or {}).get("kanban") or {}).get("result_cards") or {}
-        endpoint = settings.get("ingest_url")
-        token = os.environ.get("LITTERBOX_SOURCE_TOKEN")
-        if not endpoint or not token:
-            return False
-        request = Request(
-            endpoint,
-            data=json.dumps(card, ensure_ascii=False).encode("utf-8"),
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        with build_opener(_NoIngestRedirect()).open(request, timeout=10) as response:
-            return response.status == 204
-    except Exception:
-        logger.warning("kanban result card ingest failed; retaining Telegram delivery")
-        return False
 
 
 class GatewayKanbanWatchersMixin:
@@ -901,15 +875,13 @@ class GatewayKanbanWatchersMixin:
                             # outcome there, not by skipping the send here.
                             continue
                         card = d["result_cards"].get(ev.id)
-                        if (
-                            card and platform_str == "telegram"
-                            and (not sub_profile or sub_profile == notifier_profile)
-                            and await _to_thread_process_service(_ingest_result_card, card)
-                        ):
-                            # Skip only this ordinary result's text/attachments.
-                            # The creator wake and every other event retain their semantics.
-                            sub_fail_counts.pop(sub_key, None)
-                            continue
+                        if card and platform_str == "telegram" and (not sub_profile or sub_profile == notifier_profile):
+                            from gateway.result_ingest import ingest_result_card as _shared_ingest_result_card
+                            if await _to_thread_process_service(_shared_ingest_result_card, card):
+                                # Skip only this ordinary result's text/attachments.
+                                # The creator wake and every other event retain their semantics.
+                                sub_fail_counts.pop(sub_key, None)
+                                continue
                         try:
                             _send_res = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,

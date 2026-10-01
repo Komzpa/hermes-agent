@@ -2248,6 +2248,9 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    output_kind: Optional[str] = None,
+    urgent: Optional[bool] = None,
+    approval_required: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2354,6 +2357,12 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_output_kind = str(output_kind).strip() if isinstance(output_kind, str) else None
+    normalized_output_kind = normalized_output_kind or None
+    if normalized_output_kind is not None and normalized_output_kind not in ("assistant_reminder",):
+        raise ValueError("output_kind must be assistant_reminder when set")
+    normalized_urgent = bool(urgent) if urgent is not None else None
+    normalized_approval = bool(approval_required) if approval_required is not None else None
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -2466,6 +2475,14 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # Assistant-reminder classification originates in the producer tool call,
+    # never by regex. Absent key = ordinary scheduled job (byte-identical).
+    if normalized_output_kind is not None:
+        job["output_kind"] = normalized_output_kind
+    if normalized_urgent:
+        job["urgent"] = True
+    if normalized_approval:
+        job["approval_required"] = True
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2580,6 +2597,22 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["reasoning_effort"] = _normalize_reasoning_effort(
                     updates["reasoning_effort"]
                 )
+            # Assistant-reminder classification: explicit producer flag only.
+            # Empty string/None clears back to an ordinary scheduled job.
+            if "output_kind" in updates:
+                _ok = updates["output_kind"]
+                _ok = str(_ok).strip() if isinstance(_ok, str) else None
+                _ok = _ok or None
+                if _ok is not None and _ok not in ("assistant_reminder",):
+                    raise ValueError("output_kind must be assistant_reminder when set")
+                updates["output_kind"] = _ok
+            for _flag in ("urgent", "approval_required"):
+                if _flag in updates:
+                    _fv = updates[_flag]
+                    updates[_flag] = True if _fv in (True, 1, "true", "True", "1") else None
+                    if updates[_flag] is None:
+                        # Clearing restores ordinary semantics; drop the key on merge.
+                        pass
 
             # Normalize repeat the same way create_job does. Callers pass
             # either the stored dict shape ({"times": N, "completed": M}) or
@@ -2602,6 +2635,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            for _drop in ("output_kind", "urgent", "approval_required"):
+                if updated.get(_drop) is None:
+                    updated.pop(_drop, None)
 
             if (
                 is_terminal_job(job)
@@ -3466,6 +3502,7 @@ def claim_job_for_fire(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    scheduled_at: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
@@ -3475,6 +3512,7 @@ def claim_job_for_fire(
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
             return_job=return_job,
+            scheduled_at=scheduled_at,
         )
 
 
@@ -3484,6 +3522,7 @@ def _claim_job_for_fire_locked(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    scheduled_at: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -3546,7 +3585,14 @@ def _claim_job_for_fire_locked(
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
-            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            # A stale lease retries the same occurrence even though the recurring
+            # cursor has already advanced. Completion clears this snapshot.
+            occurrence = (
+                existing.get("scheduled_at") if isinstance(existing, dict) else None
+            ) or scheduled_at or job.get("next_run_at") or now.isoformat()
+            job["fire_claim"] = {
+                "at": now.isoformat(), "by": owner, "scheduled_at": occurrence,
+            }
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())

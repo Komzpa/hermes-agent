@@ -806,6 +806,12 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["context_from"] = external_refs
     if isinstance(job.get("attach_to_session"), bool):
         result["attach_to_session"] = job["attach_to_session"]
+    if job.get("output_kind"):
+        result["output_kind"] = job["output_kind"]
+    if job.get("urgent"):
+        result["urgent"] = True
+    if job.get("approval_required"):
+        result["approval_required"] = True
     return result
 
 
@@ -1482,6 +1488,9 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    output_kind: Optional[str] = None,
+    urgent: Optional[bool] = None,
+    approval_required: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1564,6 +1573,10 @@ def cronjob(
             # the job wakes up with its own previous run's output injected.
             if continuity is not None:
                 context_from = _apply_continuity(context_from, continuity)
+            if output_kind is not None:
+                _ok_create = str(output_kind).strip() if isinstance(output_kind, str) else ""
+                if _ok_create not in ("assistant_reminder", ""):
+                    return tool_error("output_kind must be assistant_reminder when set", success=False)
 
             from cron.scheduler import (
                 CronSchedulerRegistrationError,
@@ -1598,6 +1611,9 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    output_kind=str(output_kind).strip() if isinstance(output_kind, str) and str(output_kind).strip() else None,
+                    urgent=bool(urgent) if urgent is not None else None,
+                    approval_required=bool(approval_required) if approval_required is not None else None,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1814,6 +1830,15 @@ def cronjob(
                 # CLI-only lane (see create above): update_job validates
                 # against the canonical grammar; empty string clears the pin.
                 updates["reasoning_effort"] = reasoning_effort
+            if output_kind is not None:
+                _ok_upd = str(output_kind).strip() if isinstance(output_kind, str) else ""
+                if _ok_upd not in ("assistant_reminder", ""):
+                    return tool_error("output_kind must be assistant_reminder when set", success=False)
+                updates["output_kind"] = _ok_upd or None
+            if urgent is not None:
+                updates["urgent"] = True if urgent else None
+            if approval_required is not None:
+                updates["approval_required"] = True if approval_required else None
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
             # only when this update supplies provider/base_url. A job persisted
             # before this guard (or written directly to the jobs store) may
@@ -2029,6 +2054,19 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "boolean",
                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
             },
+            "output_kind": {
+                "type": "string",
+                "enum": ["assistant_reminder"],
+                "description": "Set to 'assistant_reminder' when the assistant sets a reminder for the user (e.g. 'remind me in 30m'). The run's final response becomes a timed Litterbox card via the shared source-auth ingest (HTTP 204 receipt gates Telegram suppression). Omit for all other scheduled jobs; never set by regex."
+            },
+            "urgent": {
+                "type": "boolean",
+                "description": "True = urgent reminder: Telegram delivery is retained and no ingest card is attempted. Use only when the reminder is genuinely time-critical."
+            },
+            "approval_required": {
+                "type": "boolean",
+                "description": "True = approval request: Telegram delivery is retained and no ingest card is attempted."
+            },
         },
         "required": ["action"]
     }
@@ -2097,6 +2135,9 @@ def _cronjob_handler(args, **kw):
         attach_to_session=args.get("attach_to_session"),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
+        output_kind=args.get("output_kind"),
+        urgent=args.get("urgent"),
+        approval_required=args.get("approval_required"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     )

@@ -3072,11 +3072,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    # Assistant-reminder lane (R26/R27): explicitly classified reminders become
+    # timed cards via the shared source-auth ingest, even for deliver=local
+    # (the card IS the delivery). A canonical 204 suppresses only the matching
+    # ordinary Telegram text/files; failed ingest preserves delivery;
+    # urgent/approval and non-reminder jobs are untouched.
+    reminder_ingested = False
+    try:
+        from gateway.result_ingest import try_ingest_assistant_reminder
+
+        reminder_ingested = bool(try_ingest_assistant_reminder(job, content))
+    except Exception:
+        reminder_ingested = False
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
-            return None  # local-only jobs don't deliver — not a failure
+            return None  # local-only jobs don't deliver — not a failure (reminder card already ingested above when classified)
         # deliver=origin with no resolvable origin and no configured home
         # channels: treat as local rather than reporting an error.  CLI-created
         # jobs never capture a {platform, chat_id} origin, so failing here would
@@ -3182,6 +3194,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        if reminder_ingested and str(platform_name).lower() == "telegram":
+            logger.info("Job '%s': assistant reminder ingested (204); suppressing ordinary Telegram delivery", job.get("id", "?"))
+            continue
 
         # bot-chat targets don't ride a gateway adapter: the output becomes a
         # real inbound turn in the target profile's canonical Bot Chat via the
@@ -8078,7 +8093,9 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(job["id"], return_job=True)
+            claimed = claim_job_for_fire(
+                job["id"], return_job=True, scheduled_at=job["next_run_at"],
+            )
             if not claimed:
                 finish_execution(
                     job["execution_id"],
