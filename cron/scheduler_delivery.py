@@ -1958,15 +1958,14 @@ def _deliver_result(
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
-    if not targets:
-        _record_delivery_verification(job, [])
-        return _unresolved_delivery_outcome(job, for_failure)
 
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
     # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
     # id is the idempotency key (the queue never retries an uncertain claimed send). Match on THIS
     # job's own attempt: a worker's script may dispatch another job in-process (`hermes cron run`),
-    # and that nested delivery must not be keyed under the outer execution id.
+    # and that nested delivery must not be keyed under the outer execution id. This handoff runs
+    # BEFORE any ingest: only the gateway that dequeues the send performs the reminder ingest, so
+    # a transient external worker never double-ingests or leaves a duplicate in chat.
     external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
     if (external_execution and adapters is None
             and external_execution == str(job.get("execution_id") or "")
@@ -1983,6 +1982,25 @@ def _deliver_result(
         refreshed = get_job(job["id"]) or {}
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
         return error
+
+    # Assistant-reminder lane (R26/R27): explicitly classified reminders become timed cards via
+    # the shared source-auth ingest, even for deliver=local (the card IS the delivery). Only the
+    # delivering gateway/standalone reaches this point (an external worker queued above). A
+    # canonical 204 suppresses only the matching ordinary Telegram text/files; failed ingest
+    # preserves delivery; urgent/approval and non-reminder jobs are untouched.
+    reminder_ingested = False
+    if not for_failure:
+        try:
+            from gateway.result_ingest import try_ingest_assistant_reminder
+            reminder_ingested = bool(try_ingest_assistant_reminder(job, content))
+        except Exception:
+            reminder_ingested = False
+
+    if not targets:
+        _record_delivery_verification(job, [])
+        if reminder_ingested:
+            return None  # reminder card already ingested; local-only is not a failure
+        return _unresolved_delivery_outcome(job, for_failure)
 
     from gateway.config import load_gateway_config
 
@@ -2061,6 +2079,9 @@ def _deliver_result(
         if (for_failure and target["platform"] != BOT_CHAT_PLATFORM
                 and not warning_notifications_enabled(target["platform"], user_cfg)):
             suppressed_targets += 1
+            continue
+        if reminder_ingested and str(target.get("platform") or "").lower() == "telegram":
+            logger.info("Job '%s': assistant reminder ingested (204); suppressing ordinary Telegram delivery", job.get("id", "?"))
             continue
         # Bot Chat owns admission; never concurrently resume a live owner's transcript.
         if target["platform"] == BOT_CHAT_PLATFORM:

@@ -1880,6 +1880,8 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
+        # Receipt-gated ordinary research/brief delivery; empty disables cutover.
+        "result_cards": {"ingest_url": ""},
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
@@ -2763,6 +2765,14 @@ def _base_url(name, prompt_name=None):
 # checklists; category: provider|tool|skill|messaging|setting, advanced=True hides from checklists,
 # tools=[...] lists the model tools the key unlocks.
 OPTIONAL_ENV_VARS = {
+    "LITTERBOX_SOURCE_TOKEN": {
+        "description": "Litterbox tenant/source-scoped ingest token for result cards",
+        "prompt": "Litterbox source token",
+        "url": None,
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
     # ── Provider (handled in provider selection, not shown in checklists) ──
     "NOUS_BASE_URL": _base_url("Nous Portal"),
     "HERMES_ANON_API_SECRET": _env(
