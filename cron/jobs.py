@@ -1677,6 +1677,24 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_output_kind(value) -> "Optional[str]":
+    if value is None:
+        return None
+    text = str(value).strip() if isinstance(value, str) else None
+    text = text or None
+    if text is not None and text not in ("assistant_reminder",):
+        raise ValueError("output_kind must be assistant_reminder when set")
+    return text
+
+
+def _normalize_flag_true_or_none(value) -> "Optional[bool]":
+    if value is None:
+        return None
+    if value in (True, 1, "true", "True", "1"):
+        return True
+    return None
+
+
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1691,12 +1709,18 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
+    "output_kind": _normalize_output_kind,
+    "urgent": _normalize_flag_true_or_none,
+    "approval_required": _normalize_flag_true_or_none,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "output_kind": _normalize_output_kind,
+    "urgent": _normalize_flag_true_or_none,
+    "approval_required": _normalize_flag_true_or_none,
 }
 
 
@@ -1807,6 +1831,9 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    output_kind: Optional[str] = None,
+    urgent: Optional[bool] = None,
+    approval_required: Optional[bool] = None,
     failure_deliver: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
@@ -1903,9 +1930,15 @@ def create_job(
     # Optional keys are persisted only when explicitly set: an absent key falls back to global
     # config (attach/reasoning) or to ``deliver`` (failure_deliver), byte-identical to pre-feature
     # jobs.
+    # Assistant-reminder classification originates in the producer tool call,
+    # never by regex. Absent key = ordinary scheduled job (byte-identical).
+    _ok = f.get("output_kind")
+    _urg = f.get("urgent")
+    _appr = f.get("approval_required")
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
+        ("output_kind", _ok), ("urgent", _urg), ("approval_required", _appr),
     ):
         if value is not None:
             job[key] = value
@@ -2074,6 +2107,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     def apply(jobs, i, job):
         _rederive_repeat_for_schedule_change(job, updates)
         _normalize_job_updates(job, updates)
+        for _drop in ("output_kind", "urgent", "approval_required"):
+            if _drop in updates and updates[_drop] is None:
+                updates.pop(_drop, None)
+                job.pop(_drop, None)
         previous_inference_axes = _normalized_inference_axes(job)
         updated = _apply_skill_fields({**job, **updates})
         _reject_terminal_activation(job, updated, job_id)

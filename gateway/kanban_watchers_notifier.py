@@ -93,6 +93,140 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     return str(resolved) if resolved else None
 
 
+def _collect_kanban_artifact_paths(event_payload, task_result=None):
+    """Single source for completion artifact paths (Telegram + result cards).
+
+    Explicit ``event_payload['artifacts']`` entries are the staged deliverable
+    and win over prose mentions (summary / legacy task result): a prose path
+    whose basename matches a staged copy is dropped so a scratch original is
+    never uploaded alongside (or instead of) its staged copy.
+    """
+    import os as _os
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    explicit: list[str] = []
+    prose_paths: list[str] = []
+
+    def _add(path: str) -> None:
+        if not path:
+            return
+        expanded = _os.path.expanduser(path)
+        if expanded in seen:
+            return
+        if not _os.path.isfile(expanded):
+            return
+        seen.add(expanded)
+        candidates.append(expanded)
+
+    if isinstance(event_payload, dict):
+        raw = event_payload.get("artifacts")
+        if isinstance(raw, (list, tuple)):
+            explicit = [item for item in raw if isinstance(item, str)]
+        summary = event_payload.get("summary")
+        if isinstance(summary, str) and summary:
+            from gateway.platforms.base import BasePlatformAdapter
+
+            prose_paths += BasePlatformAdapter.extract_local_files(summary)[0]
+    if task_result:
+        from gateway.platforms.base import BasePlatformAdapter
+
+        prose_paths += BasePlatformAdapter.extract_local_files(str(task_result))[0]
+    staged_names = {_os.path.basename(p) for p in explicit}
+    for path in explicit:
+        _add(path)
+    for path in prose_paths:
+        if _os.path.basename(path) not in staged_names:
+            _add(path)
+    if not candidates:
+        return []
+    from gateway.platforms.base import BasePlatformAdapter
+
+    return BasePlatformAdapter.filter_local_delivery_paths(candidates)
+
+
+def _completed_result_card(task, event, run, board):
+    """Only explicitly classified research/brief handoffs belong in the inbox."""
+    from datetime import datetime, timezone
+
+    metadata = run.metadata if run and isinstance(getattr(run, "metadata", None), dict) else {}
+    kind = metadata.get("output_kind")
+    if kind not in ("research_result", "proactive_brief"):
+        return None
+    summary = (getattr(run, "summary", None) if run else None) or (task.result if task and getattr(task, "result", None) else None) or ""
+    summary = str(summary)
+    title = (task.title.strip() if task and getattr(task, "title", None) else None) or event.task_id
+    if not summary.strip() or summary.strip().casefold() == str(title).casefold():
+        return None
+    if metadata.get("urgent") or metadata.get("approval_required"):
+        return None
+    payload = event.payload if isinstance(getattr(event, "payload", None), dict) else {}
+    candidates = _collect_kanban_artifact_paths(payload, task.result if task else None)
+    raw_explicit = metadata.get("artifacts") or (payload or {}).get("artifacts")
+    if raw_explicit and not candidates:
+        return None
+    files = None
+    if candidates:
+        from gateway.result_ingest import encode_result_card_files
+
+        files = encode_result_card_files(candidates)
+        if files is None:
+            return None
+    try:
+        at = datetime.fromtimestamp(event.created_at, timezone.utc).isoformat()
+    except Exception:
+        # An untimeable event would ship an untimed card; keep Telegram instead.
+        return None
+    card = {
+        "external_id": f"kanban:{board or 'default'}:{event.task_id}:result:{event.id}",
+        "kind": kind,
+        "title": title,
+        "summary": summary,
+        "at": at,
+        "timed": False,
+    }
+    if files:
+        card["files"] = files
+    return card
+
+
+def _run_for_event(board, event):
+    """Fetch the run row for a completion event; None when absent."""
+    try:
+        if not getattr(event, "run_id", None):
+            return None
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kbc().connect(board=board)
+        try:
+            return _kb.get_run(conn, event.run_id)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+def _ingest_result_card_for_event(task, event, board) -> bool:
+    """Run lookup + card build + ingest POST for one completion event.
+
+    Runs in a worker thread: building the card reads artifact bytes and the
+    POST must both stay off the event loop. The ingest configuration gate
+    precedes every file read, so a disabled result-card lane never touches
+    artifact bytes.
+    """
+    from gateway import result_ingest
+
+    if not result_ingest._ingest_configured():
+        return False
+    card = _completed_result_card(task, event, _run_for_event(board, event), board)
+    if card is None:
+        return False
+    return result_ingest.ingest_result_card(card)
+
+
 _ANCHORLESS_WARNED: set[tuple] = set()
 
 
@@ -698,6 +832,22 @@ class _KanbanNotification:
                 continue
             if ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue
+            # Research/brief cutover: a canonical 204 receipt suppresses only the matching
+            # ordinary Telegram text result AND its native uploads. Missing files, over-limit
+            # batches, non-204 answers, unconfigured ingest, urgent/approval, and non-research
+            # kinds keep Telegram. Only the notifier's own profile may cut over: a secondary
+            # profile's sub keeps native delivery (0 ingest POSTs).
+            if ev.kind == "completed" and self.platform_str == "telegram" and (
+                    not self.sub_profile or self.sub_profile == getattr(self.runner, "_kanban_notifier_profile", None)):
+                try:
+                    if await _to_thread_process_service(_ingest_result_card_for_event, self.task, ev, self.board_slug):
+                        logger.info(
+                            "kanban notifier: result card ingested (204) for %s; suppressing ordinary Telegram result",
+                            self.task_id)
+                        self.clear_failures()
+                        continue
+                except Exception as _card_exc:
+                    logger.debug("kanban notifier: result card ingest for %s failed: %s", self.task_id, _card_exc)
             try:
                 await self._send_event(ev, msg)
                 await _to_thread_process_service(partial(

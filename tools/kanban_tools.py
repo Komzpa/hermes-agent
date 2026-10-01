@@ -637,6 +637,11 @@ def _handle_complete(args: dict, **kw) -> str:
         metadata = _merge_artifacts(metadata, artifacts)
     _check(summary or result, "provide at least one of: summary (preferred), result")
     _require_dict_metadata(metadata)
+    output_kind = args.get("output_kind")
+    if output_kind is not None:
+        _check(output_kind in ("research_result", "proactive_brief", "other"), "output_kind must be research_result, proactive_brief, or other")
+        metadata = dict(metadata or {})
+        metadata["output_kind"] = output_kind
     metadata = _stamp_worker_session_metadata(tid, metadata)
     with _board(args.get("board")) as (kb, conn):
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
