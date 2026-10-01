@@ -1615,6 +1615,19 @@ class GatewayInboundMixin:
     @staticmethod
     def _prepend_inbound_reply_context(event: MessageEvent, source: SessionSource, message_text: str) -> str:
         """Prepend the reply-to pointer, then the Discord triggering-message note (outermost)."""
+        # Keep the replied-to Telegram message id on the per-turn user text.
+        # The bridge needs this volatile id to route replies to their origin;
+        # putting it in the cached system prompt would invalidate prompt reuse.
+        if (
+            source is not None
+            and getattr(source, "platform", None) == Platform.TELEGRAM
+            and getattr(event, "reply_to_message_id", None)
+        ):
+            message_text = (
+                f"[Telegram reply target message_id: `{event.reply_to_message_id}`]\n\n"
+                f"{message_text}"
+            )
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer even when the quoted text is already in history:
             # it's disambiguation (*which* prior message), not deduplication.
@@ -1742,6 +1755,32 @@ class GatewayInboundMixin:
         # Prefer the caller's resolved session key so this write key matches the consume key at the
         # run_conversation site; derive it here only for tests and legacy standalone callers.
         session_key = session_key or self._session_key_for_source(source)
+        from gateway.delivery_ledger import inbound_transfer_state, resolve_reply_receipt
+        members = event.original_inputs()
+        provenance = []
+        for member in members:
+            state = (inbound_transfer_state(session_key, member["inbound_id"])
+                     if member["inbound_id"] else None)
+            provenance.append({**member, "delivery_state": state,
+                               "kind": "internal_notification" if member["internal"] else "owner_message"})
+            if member.get("reply_to_message_id"):
+                provenance[-1]["prior_output"] = resolve_reply_receipt(
+                    session_key, str(getattr(source.platform, "value", source.platform)),
+                    source.chat_id, source.thread_id, member["reply_to_message_id"])
+        if provenance and all(item["delivery_state"] for item in provenance):
+            # The stored output, not another model turn, owns recovery.
+            return None
+        if any(item["delivery_state"] for item in provenance):
+            # A restored batch may mix old transfers with genuinely new input.
+            # Remove the old members from both model work and the next output's
+            # ownership links; otherwise recording that output conflicts with
+            # their authoritative earlier output.
+            members = [member for member, item in zip(members, provenance)
+                       if item["delivery_state"] is None]
+            event.retain_inputs(members)
+            provenance = [item for item in provenance if item["delivery_state"] is None]
+            message_text = event.text
+            _pending_stt_prepared = False
         # Reset only this session's per-call buffer; other sessions may be concurrently preparing.
         self._consume_pending_native_image_paths(session_key)
 
@@ -1759,7 +1798,13 @@ class GatewayInboundMixin:
                 return None
         # After expansion: the quoted reply is someone else's text and stays literal — an
         # ``@file:`` inside it must never read a local file on the replier's behalf.
-        return self._prepend_inbound_reply_context(event, source, message_text)
+        message_text = self._prepend_inbound_reply_context(event, source, message_text)
+        event.ingress_provenance = provenance
+        if event.input_members or any(m["inbound_id"] for m in members):
+            import json
+            message_text = ("[Gateway ingress provenance]\n" +
+                            json.dumps(provenance, ensure_ascii=False) + "\n\n" + message_text)
+        return message_text
 
     async def _prepare_profile_scoped_inbound_message_text(
         self, *, event: MessageEvent, source: SessionSource, history: List[Dict[str, Any]],

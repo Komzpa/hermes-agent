@@ -172,6 +172,19 @@ def _failure_streak_nudge(job: dict) -> str:
     )
 
 
+def _cron_failure_delivery_enabled() -> bool:
+    """Whether cron failures may be copied into a user chat.
+
+    Durable execution records and logs remain authoritative either way.
+    """
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron") or {}
+        return bool(cron_cfg.get("deliver_failures", True))
+    except Exception:
+        return True
+
+
 def _detect_gateway_code_skew() -> tuple[str, str] | None:
     """Boot-vs-disk revision skew for THIS process, or None. Test seam over
     ``gateway.code_skew.detect_code_skew``; a broken import must never take delivery down."""
@@ -566,6 +579,15 @@ def _cron_failure_marker_error(text: str) -> Optional[str]:
     return evidence or "Cron agent reported failure."
 
 
+class _ScriptGateSilence(str):
+    """Run-local provenance for a successful script's explicit wakeAgent=false.
+
+    Keep the public four-tuple/string result compatible. Only the scheduler can
+    produce this type; model text or a matching audit document is not authority
+    to bypass the required-response contract.
+    """
+
+
 def _is_cron_silence_response(text: str) -> bool:
     """True when a cron final response should suppress delivery: ``[SILENT]`` (or SILENT /
     NO_REPLY / NO REPLY) as the whole response OR its own first/last line — NOT mid-sentence.
@@ -579,6 +601,20 @@ def _is_cron_silence_response(text: str) -> bool:
     from gateway.response_filters import is_autonomous_silence_response
 
     return is_autonomous_silence_response(text)
+
+
+def _forbidden_final_response(job: dict, text: str) -> str | None:
+    """Return a configured whole-response token that may not count as a reply."""
+    response = (text or "").strip()
+    if not response:
+        return None
+    for token in job.get("forbidden_final_responses") or ():
+        token_text = str(token).strip()
+        if token_text and response == token_text:
+            return token_text
+        if _is_cron_silence_response(token_text) and _is_cron_silence_response(response):
+            return token_text
+    return None
 
 # Persistent pool for parallel cron jobs: tick() submits and returns; long jobs never block it.
 # Keyed by profile home: one host gateway multiplexes every profile, and ``max_parallel_jobs`` is a
@@ -1483,7 +1519,7 @@ def _resolve_job_workdir(job: dict, job_id: str) -> Optional[str]:
 
 
 def _run_no_agent_job(
-    job: dict, job_id: str, job_name: str, cancel_event,
+    job: dict, job_id: str, job_name: str, cancel_event, execution_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """no_agent short-circuit — the script IS the job (no AIAgent, no tokens). stdout → delivered
     verbatim; empty stdout or wakeAgent=false → silent success; non-zero exit/timeout → error alert.
@@ -1507,8 +1543,14 @@ def _run_no_agent_job(
     # Pass workdir as subprocess cwd; never os.chdir() (leaks into concurrent gateway sessions).
     _job_workdir = _resolve_job_workdir(job, job_id)
     try:
+        script_kwargs = {
+            "workdir": _job_workdir,
+            "cancel_event": cancel_event,
+        }
+        if execution_id is not None:
+            script_kwargs["execution_id"] = execution_id
         ok, output = _run_job_script_with_claim_heartbeat(
-            job, script_path, workdir=_job_workdir, cancel_event=cancel_event)
+            job, script_path, **script_kwargs)
     except Exception as exc:
         logger.exception("Job '%s': script execution raised unexpectedly", job_id)
         ok, output = False, f"Script execution failed: {exc}"
@@ -1528,7 +1570,7 @@ def _run_no_agent_job(
     # wakeAgent=false is a silent signal, same as empty stdout.
     if not _parse_wake_gate(output):
         logger.info("Job '%s' (no_agent): wakeAgent=false gate — silent run", job_id)
-        return True, f"{header}**Status:** silent (wakeAgent=false)\n", SILENT_MARKER, None
+        return True, f"{header}**Status:** silent (wakeAgent=false)\n", _ScriptGateSilence(SILENT_MARKER), None
 
     if not output.strip():
         logger.info("Job '%s' (no_agent): empty stdout — silent run", job_id)
@@ -2170,6 +2212,7 @@ _RunResult = tuple[bool, str, str, Optional[str]]
 
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
+    execution_id: Optional[str] = None,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
@@ -2187,7 +2230,7 @@ def _prepare_job_prompt(
 
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
-        return _run_no_agent_job(job, job_id, job_name, cancel_event), None
+        return _run_no_agent_job(job, job_id, job_name, cancel_event, execution_id), None
 
     # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
     from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
@@ -2209,13 +2252,24 @@ def _prepare_job_prompt(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
+        script_kwargs = {"workdir": _resolve_job_workdir(job, job_id), "cancel_event": cancel_event}
+        if execution_id is not None:
+            script_kwargs["execution_id"] = execution_id
         prerun_script = _run_job_script_with_claim_heartbeat(
-            job,
-            script_path,
-            workdir=_resolve_job_workdir(job, job_id),
-            cancel_event=cancel_event,
-        )
+            job, script_path, **script_kwargs)
         _ran_ok, _script_output = prerun_script
+        if not _ran_ok and not _cron_failure_delivery_enabled():
+            logger.error(
+                "Job '%s' (ID: %s): pre-run script failed; agent and user delivery suppressed",
+                job_name, job_id)
+            failure_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Status:** pre-run script failed\n\n"
+                f"{_script_output}\n"
+            )
+            return (False, failure_doc, "", _script_output), None
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             note_cron_skipped(job)
@@ -2225,7 +2279,7 @@ def _prepare_job_prompt(
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
-            return (True, silent_doc, SILENT_MARKER, None), None
+            return (True, silent_doc, _ScriptGateSilence(SILENT_MARKER), None), None
 
     try:
         prompt = _build_job_prompt(
@@ -2438,7 +2492,8 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         # Project context files only with a configured workdir; SOUL.md always.
         skip_context_files=not bool(workdir),
         load_soul_identity=True,
-        skip_memory=False,
+        # Upstream stays memory-free by default. Private profiles may opt in to their configured provider.
+        skip_memory=not bool((_cfg.get("cron") or {}).get("load_memory", False)),
         skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
         platform="cron",
         session_id=session_id,
@@ -2492,7 +2547,8 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+    early, prompt = _prepare_job_prompt(
+        job, job_id, job_name, extra_prompt, cancel_event, execution_id)
     if early is not None:
         return early
     from run_agent import AIAgent
@@ -2958,6 +3014,7 @@ class _RunDelivery:
     agent_declared: bool = False
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
+    terminal_status: Optional[str] = None
     side_effect_ownership_lost: bool = False
 
 
@@ -2994,6 +3051,24 @@ def _save_compose_deliver(
         output_file=output_file, agent_declared=d.agent_declared)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
+    if not d.success and not _cron_failure_delivery_enabled():
+        logger.info(
+            "Job '%s': failure delivery disabled; details remain in durable cron output", job["id"])
+        d.should_deliver = False
+    forbidden_response = _forbidden_final_response(job, deliver_content)
+    # An explicit successful pre-run gate skips the agent, so its scheduler-
+    # generated marker is not a forbidden model reply. Do not infer provenance
+    # from output prose or job-wide state (concurrent fires share the job).
+    script_gate_suppressed = isinstance(final_response, _ScriptGateSilence)
+    if d.should_deliver and d.success and forbidden_response and not script_gate_suppressed:
+        d.success = False
+        d.error = (
+            "Forbidden final response {!r}; cron contract requires a user-facing "
+            "message or an allowed suppression marker."
+        ).format(forbidden_response)
+        d.terminal_status = "forbidden_final_response"
+        d.should_deliver = False
+        logger.warning("Job '%s': forbidden final response %s", job["id"], forbidden_response)
     if d.should_deliver and not d.success and job.get("_model_unreachable"):
         # The model was never reached and a bounded automatic re-run will be scheduled
         # (cron/unreachable_retry.py): hold the failure notice — the re-run either
@@ -3087,6 +3162,8 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
+    elif d.terminal_status:
+        mark_kwargs["status"] = d.terminal_status
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
     marked = self_removal_delivery_allowed(job["id"]) or mark_job_run(
         job["id"], d.success, d.error, **mark_kwargs)
@@ -3118,6 +3195,8 @@ def _deliver_crash_failure(
     job: dict, err_text: str, *, adapters, loop,
 ) -> tuple[Optional[str], str]:
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
+    if not _cron_failure_delivery_enabled():
+        return None, "suppressed"
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)

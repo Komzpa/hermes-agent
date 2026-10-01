@@ -324,6 +324,7 @@ wake = [
   "numpy==2.4.3",
 ]
 honcho = ["honcho-ai==2.2.0"]
+hindsight = ["hindsight-client==0.10.1"]
 # Platform sub-extras / alias extras — declared so pm.extras.ANCHORS names
 # only real extras (contract: tests/pm/test_extras.py). Each is
 # lazy-installed at first use via pm.ensure_import(name) and therefore
@@ -728,6 +729,7 @@ google-auth-httplib2 = false
 google-auth-oauthlib = false
 google-cloud-pubsub = false
 h2 = false
+hindsight-client = false
 honcho-ai = false
 httplib2 = false
 httpx = false
