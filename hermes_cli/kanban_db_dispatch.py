@@ -2202,6 +2202,9 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    if not dry_run:
+        from hermes_cli.kanban_recovery_review import reconcile_recovery_reviews
+        reconcile_recovery_reviews(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 

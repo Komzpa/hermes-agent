@@ -1632,6 +1632,7 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    goal_context_fn=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1682,6 +1683,14 @@ def run_kanban_goal_loop(
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return _result("stopped", f"status={status}")
 
+        if goal_context_fn is not None:
+            try:
+                goal_text = goal_context_fn()
+                if not isinstance(goal_text, str) or not goal_text.strip():
+                    raise ValueError("empty current acceptance context")
+            except Exception as exc:
+                _log(f"kanban goal loop: acceptance context unavailable ({exc}); stopping")
+                return _result("stopped", "current acceptance context unavailable")
         # The between-turns judge runs outside any agent turn: bind the per-task relay-affinity
         # scope (same shape as the handoff gates) so the relay does not reject the call (#113669).
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
