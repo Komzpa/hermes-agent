@@ -861,7 +861,8 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, conn
         try:
             verdict, reason, _, _, transport_failed = judge_goal(
                 goal=goal,
-                last_response=evidence.strip())
+                last_response=evidence.strip(),
+                **({"acceptance_context": goal} if conn is not None else {}))
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)

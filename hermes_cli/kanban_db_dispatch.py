@@ -1965,14 +1965,20 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
-    """Run one dispatcher tick under the board's single-writer lock.
+    """Run one dispatcher claim tick under the board's single-writer lock.
 
     Wraps :func:`_dispatch_once_locked` in the non-blocking :func:`_dispatch_tick_lock`
     so two dispatchers on one ``kanban.db`` never race a write tick on WAL
     frames. The loser returns an empty ``DispatchResult`` with
-    ``skipped_locked=True`` and writes nothing; the lock is keyed on the
+    ``skipped_locked=True`` and writes no claim tick state; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
     """
+    if not dry_run:
+        # Semantic verification must never hold the dispatcher's board lock.
+        # Recovery owns a separate native write transaction with snapshot CAS.
+        from hermes_cli.kanban_recovery_review import reconcile_recovery_reviews
+        reconcile_recovery_reviews(conn)
+
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
@@ -2202,9 +2208,6 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
-    if not dry_run:
-        from hermes_cli.kanban_recovery_review import reconcile_recovery_reviews
-        reconcile_recovery_reviews(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 

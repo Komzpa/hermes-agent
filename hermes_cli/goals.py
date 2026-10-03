@@ -899,6 +899,7 @@ def judge_goal(
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    acceptance_context: Optional[str] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -923,8 +924,12 @@ def judge_goal(
     # Prompt priority: contract > subgoals > plain. With both, subgoals fold into the contract
     # block as extra criteria so the judge sees a single source of truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
+    if acceptance_context is not None:
+        from hermes_cli.kanban_acceptance_context import MAX_ACCEPTANCE_CONTEXT_CHARS
+        if len(acceptance_context) > MAX_ACCEPTANCE_CONTEXT_CHARS:
+            return "blocked", "acceptance context exceeds safe budget", False, None, False
     common = dict(
-        goal=_truncate(goal, 2000),
+        goal=acceptance_context if acceptance_context is not None else _truncate(goal, 2000),
         response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
         background_block=_render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
@@ -1696,7 +1701,8 @@ def run_kanban_goal_loop(
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task_id}")
         try:
-            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+            judge_kwargs = {"acceptance_context": goal_text} if goal_context_fn is not None else {}
+            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response, **judge_kwargs)
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)

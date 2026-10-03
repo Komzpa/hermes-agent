@@ -58,8 +58,12 @@ def reconcile_recovery_reviews(conn, *, config=None, judge=None):
         return []
     roots = config.get("root_tasks")
     if not isinstance(roots, list) or not roots or not all(isinstance(x, str) for x in roots):
-        raise ValueError("recovery_review requires an explicit root_tasks list")
-    budget = max(1, min(int(config.get("max_per_tick", 1)), 4))
+        logger.warning("recovery_review requires an explicit root_tasks list; disabled")
+        return []
+    try:
+        budget = max(1, min(int(config.get("max_per_tick", 1)), 4))
+    except (TypeError, ValueError, OverflowError):
+        budget = 1
     outcomes, attempts = [], 0
     for task_id in _scope(conn, roots):
         if attempts >= budget:
@@ -69,7 +73,10 @@ def reconcile_recovery_reviews(conn, *, config=None, judge=None):
             continue
         if task.claim_lock or task.current_run_id is not None or task.worker_pid:
             continue
-        snapshot = acceptance_snapshot(conn, task_id)
+        try:
+            snapshot = acceptance_snapshot(conn, task_id)
+        except ValueError:
+            continue
         if not snapshot["prerequisites_satisfied"]:
             continue
         digest = snapshot_digest(snapshot)
@@ -101,6 +108,8 @@ def reconcile_recovery_reviews(conn, *, config=None, judge=None):
             if decision["decision"] == "review" and not evidence:
                 raise ValueError("review requires a retained evidence reference")
             with kb.write_txn(conn):
+                if task_id not in _scope(conn, roots) or kb.get_task(conn, task_id) is None:
+                    continue
                 if snapshot_digest(acceptance_snapshot(conn, task_id)) != digest:
                     continue
                 payload = {"snapshot_sha256": digest, "decision": decision["decision"],
@@ -121,7 +130,13 @@ def reconcile_recovery_reviews(conn, *, config=None, judge=None):
         except Exception as exc:
             logger.warning("kanban recovery review refused for %s: %s", task_id, exc)
             with kb.write_txn(conn):
-                if snapshot_digest(acceptance_snapshot(conn, task_id)) == digest:
+                if task_id not in _scope(conn, roots) or kb.get_task(conn, task_id) is None:
+                    continue
+                try:
+                    current_digest = snapshot_digest(acceptance_snapshot(conn, task_id))
+                except ValueError:
+                    continue
+                if current_digest == digest:
                     payload = {"snapshot_sha256": digest, "decision": "error",
                                "reason": type(exc).__name__}
                     kb._append_event(conn, task_id, "recovery_review_checked", payload)
