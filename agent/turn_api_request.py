@@ -155,6 +155,10 @@ def build_api_request(
         _original_api_kwargs = dict(api_kwargs)
         _llm_middleware_trace = []
 
+    capture = getattr(agent, "_action_acceptance_capture", None)
+    if capture is not None:
+        capture(api_kwargs)
+
     _fire_pre_api_request_hook(
         agent, api_kwargs, api_messages, _llm_middleware_trace, messages=messages,
         original_user_message=original_user_message, approx_tokens=approx_tokens,

@@ -2525,6 +2525,18 @@ class _FireAudit:
 
 
 
+def _load_action_acceptance_gate(settings):
+    import importlib
+    root = settings.get("module_root")
+    if root:
+        for path in (Path(root).resolve(), Path(root).resolve() / "src"):
+            if not path.is_dir():
+                raise ValueError("configured action acceptance module root is absent")
+            if str(path) not in sys.path:
+                sys.path.append(str(path))
+    return importlib.import_module(settings["module"])
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
@@ -2582,11 +2594,21 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
+        acceptance = (_cfg.get("cron") or {}).get("delivery_acceptance", {}).get(job_id)
+        if acceptance and acceptance.get("compile_receipts"):
+            from cron import scheduler_delivery
+            gate = _load_action_acceptance_gate(acceptance)
+            agent._action_acceptance_capture = gate.prepare_native(
+                acceptance, job={**job, "execution_id": execution_id or job.get("execution_id")},
+                implementation_path=scheduler_delivery.__file__, preparation_text=prompt)
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
+        capture = getattr(agent, "_action_acceptance_capture", None)
+        if capture is not None:
+            job["_acceptance_expected_input"] = capture.snapshot()
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
@@ -2874,6 +2896,8 @@ def _classify_delivery_outcome(
     normalized_deliver: str, incident_acked: bool, success: bool,
     delivery_queued=None, notification_suppressed: bool = False,
 ) -> str:
+    if str(delivery_error or "").startswith("action_acceptance_refused:"):
+        return "blocked_acceptance"
     if delivery_error:
         return "failed"
     if should_deliver and delivery_queued:
@@ -3112,6 +3136,8 @@ def _save_compose_deliver(
                 # on the failure path) honor the job's failure_deliver override (NS-788).
                 for_failure=not d.success,
             )
+            if job.get("_action_acceptance_failure"):
+                d.delivery_attempted = bool(job.get("_action_acceptance_transport_attempted"))
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
             raise

@@ -1957,16 +1957,17 @@ def _deliver_result(
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
+    job.pop("_action_acceptance_failure", None)
+    job.pop("_action_acceptance_transport_attempted", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
-    if not targets:
-        _record_delivery_verification(job, [])
-        return _unresolved_delivery_outcome(job, for_failure)
 
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
     # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
     # id is the idempotency key (the queue never retries an uncertain claimed send). Match on THIS
     # job's own attempt: a worker's script may dispatch another job in-process (`hermes cron run`),
-    # and that nested delivery must not be keyed under the outer execution id.
+    # and that nested delivery must not be keyed under the outer execution id. This handoff runs
+    # BEFORE any ingest: only the gateway that dequeues the send performs the reminder ingest, so
+    # a transient external worker never double-ingests or leaves a duplicate in chat.
     external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
     if (external_execution and adapters is None
             and external_execution == str(job.get("execution_id") or "")
@@ -2052,6 +2053,78 @@ def _deliver_result(
         logger.error("Job '%s': %s", job["id"], msg)
         return msg
 
+    reminder_card = None
+    if not for_failure:
+        from gateway.result_ingest import (
+            build_assistant_reminder_card, is_assistant_reminder_job, is_urgent_or_approval_job)
+        if is_assistant_reminder_job(job) and not is_urgent_or_approval_job(job):
+            reminder_card = build_assistant_reminder_card(job, content)
+
+    def send_targets(before_send):
+        return _send_prepared_targets(
+            job, content, targets, config=config, user_cfg=user_cfg, adapters=adapters,
+            loop=loop, for_failure=for_failure, notify_delivery=notify_delivery,
+            mirror_enabled=mirror_enabled, mirror_text=mirror_text,
+            cleaned_delivery_content=cleaned_delivery_content, media_files=media_files,
+            policy_drop_errors=policy_drop_errors, unverified_targets=unverified_targets,
+            before_send=before_send, reminder_card=reminder_card,
+            guarded=settings is not None)
+
+    settings = (user_cfg or {}).get("cron", {}).get("delivery_acceptance", {}).get(job["id"])
+    if job.get("require_action_acceptance") and settings is None:
+        job["_action_acceptance_failure"] = "MissingConfiguration"
+        return "action_acceptance_refused:MissingConfiguration"
+    if settings is not None:
+        settings = {**settings, "native_implementation_path": __file__} if isinstance(settings, dict) else settings
+        if (not isinstance(settings, dict)
+                or not all(isinstance(settings.get(key), str) and settings[key].strip()
+                           for key in ("module", "artifact_root", "ledger_path"))):
+            job["_action_acceptance_failure"] = "MissingConfiguration"
+            return "action_acceptance_refused:MissingConfiguration"
+        # Configuration is profile-owned. Neither job output nor a queued job selects code.
+        import hashlib
+        from pathlib import Path
+        try:
+            gate = _sched._load_action_acceptance_gate(settings)
+            if (not callable(getattr(gate, "deliver", None))
+                    or not hasattr(gate, "ContextProofMissing")
+                    or not hasattr(gate, "ContextRevisionChanged")):
+                job["_action_acceptance_failure"] = "MissingConfiguration"
+                return "action_acceptance_refused:MissingConfiguration"
+            return gate.deliver(
+                settings=settings, job=job,
+                payload={"targets": targets, "content": cleaned_delivery_content,
+                         "media_files": media_files, "bot_chat_content": content,
+                         "for_failure": for_failure, "reminder_card": reminder_card},
+                implementation_version=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                send=send_targets)
+        except Exception as exc:
+            # No crash-failure notice, model retry or fallback transport for missing proof.
+            if ("gate" not in locals() or isinstance(exc, (gate.ContextProofMissing,
+                                                           gate.ContextRevisionChanged))):
+                job["_action_acceptance_failure"] = type(exc).__name__
+                return "action_acceptance_refused:" + type(exc).__name__
+            return "delivery_gate_error:" + type(exc).__name__
+    return send_targets(lambda target=None: None)
+
+
+def _send_prepared_targets(job, content, targets, *, config, user_cfg, adapters, loop,
+                           for_failure, notify_delivery, mirror_enabled, mirror_text,
+                           cleaned_delivery_content, media_files, policy_drop_errors,
+                           unverified_targets, before_send, reminder_card, guarded):
+    reminder_ingested = False
+    if reminder_card is not None:
+        before_send({"platform": "assistant-reminder-ingest", "chat_id": job["id"]})
+        try:
+            from gateway.result_ingest import try_ingest_assistant_reminder
+            reminder_ingested = bool(try_ingest_assistant_reminder(job, content))
+        except Exception:
+            reminder_ingested = False
+        if guarded and not reminder_ingested:
+            raise RuntimeError("reminder ingest not confirmed; reconcile before fallback")
+    if not targets:
+        _record_delivery_verification(job, [])
+        return None if reminder_ingested else _unresolved_delivery_outcome(job, for_failure)
     delivery_errors = []
     suppressed_targets = 0  # local: `job` is snapshotted into durable deferred records mid-loop
     for target in targets:
@@ -2062,8 +2135,12 @@ def _deliver_result(
                 and not warning_notifications_enabled(target["platform"], user_cfg)):
             suppressed_targets += 1
             continue
+        if reminder_ingested and str(target.get("platform") or "").lower() == "telegram":
+            logger.info("Job '%s': assistant reminder ingested (204); suppressing ordinary Telegram delivery", job.get("id", "?"))
+            continue
         # Bot Chat owns admission; never concurrently resume a live owner's transcript.
         if target["platform"] == BOT_CHAT_PLATFORM:
+            before_send(target)
             bot_chat_error = _deliver_to_bot_chat(job, content, target["chat_id"], for_failure=for_failure)
             suppressed_targets += job.pop("_notification_all_targets_suppressed", False)
             if bot_chat_error:
@@ -2082,12 +2159,15 @@ def _deliver_result(
         if t is None:
             continue
         target_errors: list = []
+        if t.live_adapter_ready:
+            before_send(target)
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(
             t, cleaned_delivery_content, media_files,
             target_errors=target_errors, delivery_errors=delivery_errors,
             unverified_targets=unverified_targets,
         )
         if not delivered:
+            before_send(target)
             _deliver_standalone(
                 t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
 
