@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 
 from agent.redact import redact_sensitive_text
 
@@ -60,8 +61,10 @@ def acceptance_snapshot(conn, task_id):
         "SELECT 1 FROM task_links l JOIN tasks t ON t.id=l.parent_id "
         "WHERE l.child_id=? AND t.status NOT IN ('done','archived') LIMIT 1",
         (task_id,)).fetchone() is None
-    attachments = _rows(conn, "SELECT id,filename,stored_path,size,created_at "
+    attachments = _rows(conn, "SELECT id,filename,size,created_at "
                         "FROM task_attachments WHERE task_id=? ORDER BY id DESC LIMIT 5", (task_id,))
+    for attachment in attachments:
+        attachment["filename"] = _text(attachment["filename"], 400)
     return {"task": task, "prerequisites": prerequisites,
             "prerequisites_satisfied": prerequisites_satisfied, "comments": comments,
             "runs": runs, "events": events, "attachments": attachments}
@@ -70,6 +73,22 @@ def acceptance_snapshot(conn, task_id):
 def snapshot_digest(snapshot):
     payload = json.dumps(snapshot, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def snapshot_payload(snapshot, *, prefix=""):
+    snapshot = deepcopy(snapshot)
+    omitted = {}
+    while True:
+        encoded = json.dumps(snapshot, ensure_ascii=False)
+        if len(prefix) + len(encoded) <= MAX_ACCEPTANCE_CONTEXT_CHARS:
+            return prefix + encoded
+        section = next((key for key in ("runs", "comments", "events", "attachments", "prerequisites")
+                        if snapshot[key]), None)
+        if section is None:
+            raise ValueError("acceptance contract exceeds safe context budget")
+        snapshot[section].pop(0)
+        omitted[section] = omitted.get(section, 0) + 1
+        snapshot["omitted_context_rows"] = omitted
 
 
 def acceptance_context(conn, task_id, *, phase="complete"):
@@ -96,14 +115,5 @@ def acceptance_context(conn, task_id, *, phase="complete"):
         "and use the supported retirement lifecycle rather than pretend the old contract passed.\n"
         "Snapshot SHA256: " + snapshot_digest(snapshot) + "\n"
     )
-    omitted = {}
-    while len(prefix) + len(json.dumps(snapshot, ensure_ascii=True)) > MAX_ACCEPTANCE_CONTEXT_CHARS:
-        section = next((key for key in ("runs", "comments", "events", "attachments", "prerequisites")
-                        if snapshot[key]), None)
-        if section is None:
-            raise ValueError("acceptance contract exceeds safe context budget")
-        snapshot[section].pop(0)
-        omitted[section] = omitted.get(section, 0) + 1
-        snapshot["omitted_context_rows"] = omitted
     # Contract first, never sacrifice its tail to fit historical evidence.
-    return prefix + json.dumps(snapshot, ensure_ascii=True)
+    return snapshot_payload(snapshot, prefix=prefix)
