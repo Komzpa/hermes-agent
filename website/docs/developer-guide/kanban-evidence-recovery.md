@@ -20,7 +20,8 @@ The classifier can return only `wait` or admission to independent `review`.
 Review admission requires references to retained evidence owned by the task,
 a spawnable reviewer, and original implementation-run provenance. A fresh
 review run may use the same profile; it never substitutes the current assignee
-for a different historical implementer. Requested changes return to that actor.
+for a different historical implementer. Requested changes return to that actor,
+who must also pass the dispatcher's profile allowlist before review admission.
 It cannot complete, archive, edit, unblock or reset loop counters. A published
 PR is not evidence of green exact-head CI; genuine external blockers stay put.
 The existing reviewer must verify actual artifacts, current requirements and
@@ -36,6 +37,9 @@ aggregate context budget, preserving the full contract and labelling omitted
 historical rows. Neither reads arbitrary local artifacts.
 Operational claim locks and worker PIDs remain in the local snapshot for
 staleness checks, but are omitted from both auxiliary prompt payloads.
+Raw persisted contract and selected evidence rows are hashed locally before
+redaction or truncation. That local fingerprint is omitted from prompt payloads;
+secret-shaped edits still invalidate cached decisions and in-flight admission.
 Legacy long titles and bodies are not rejected by per-field caps: only the shared
 aggregate budget applies. A contract that cannot fit intact blocks its owning
 goal-mode run rather than silently truncating criteria or stranding a running card.

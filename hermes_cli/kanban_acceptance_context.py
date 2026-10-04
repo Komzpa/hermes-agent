@@ -26,7 +26,14 @@ def _text(value, limit=1200):
     return value if len(value) <= limit else value[:limit] + " [truncated]"
 
 
+def _version_rows(digest, section, rows):
+    digest.update(json.dumps([section, rows], sort_keys=True, ensure_ascii=True,
+                             separators=(",", ":")).encode())
+    digest.update(b"\n")
+
+
 def acceptance_snapshot(conn, task_id):
+    local_evidence_digest = hashlib.sha256()
     columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
     contract = "completion_contract" if "completion_contract" in columns else "NULL AS completion_contract"
     tasks = _rows(conn, "SELECT id,title,body,status,assignee,block_kind,created_by," + contract + ","
@@ -34,14 +41,17 @@ def acceptance_snapshot(conn, task_id):
     if not tasks:
         raise ValueError("unknown task")
     task = tasks[0]
+    _version_rows(local_evidence_digest, "task", tasks)
     for field in ("title", "body", "completion_contract"):
         task[field] = redact_sensitive_text(str(task[field] or ""), force=True)
     comments = _rows(conn, "SELECT id,author,created_at,body FROM task_comments "
                      "WHERE task_id=? ORDER BY id DESC LIMIT 8", (task_id,))[::-1]
+    _version_rows(local_evidence_digest, "comments", comments)
     for comment in comments:
         comment["body"] = _text(comment["body"])
     runs = _rows(conn, "SELECT id,status,outcome,started_at,ended_at,summary,error,metadata "
                  "FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 5", (task_id,))[::-1]
+    _version_rows(local_evidence_digest, "runs", runs)
     for run in runs:
         for field in ("summary", "error", "metadata"):
             run[field] = _text(run[field])
@@ -49,12 +59,14 @@ def acceptance_snapshot(conn, task_id):
                    "WHERE task_id=? AND kind IN ('created','edited','blocked',"
                    "'review_requested','changes_requested','completed','archived') "
                    "ORDER BY id DESC LIMIT 5", (task_id,))[::-1]
+    _version_rows(local_evidence_digest, "events", events)
     for event in events:
         event["payload"] = _text(event["payload"])
     # Native edges are prerequisite -> dependent, including decomposition roots.
     prerequisites = _rows(conn, "SELECT t.id,t.title,t.status FROM task_links l "
                           "JOIN tasks t ON t.id=l.parent_id WHERE l.child_id=? "
                           "ORDER BY t.id LIMIT 32", (task_id,))
+    _version_rows(local_evidence_digest, "prerequisites", prerequisites)
     for prerequisite in prerequisites:
         prerequisite["title"] = _text(prerequisite["title"], 400)
     # Prompt rows are bounded; every edge and status still participates in versioning.
@@ -70,9 +82,11 @@ def acceptance_snapshot(conn, task_id):
         (task_id,)).fetchone() is None
     attachments = _rows(conn, "SELECT id,filename,size,created_at "
                         "FROM task_attachments WHERE task_id=? ORDER BY id DESC LIMIT 5", (task_id,))
+    _version_rows(local_evidence_digest, "attachments", attachments)
     for attachment in attachments:
         attachment["filename"] = _text(attachment["filename"], 400)
     return {"task": task, "prerequisites": prerequisites,
+            "_local_evidence_sha256": local_evidence_digest.hexdigest(),
             "prerequisite_set_sha256": prerequisite_digest.hexdigest(),
             "prerequisites_satisfied": prerequisites_satisfied, "comments": comments,
             "runs": runs, "events": events, "attachments": attachments}
@@ -85,6 +99,7 @@ def snapshot_digest(snapshot):
 
 def snapshot_payload(snapshot, *, prefix=""):
     snapshot = deepcopy(snapshot)
+    snapshot.pop("_local_evidence_sha256", None)
     for field in ("claim_lock", "worker_pid"):
         snapshot["task"].pop(field, None)
     omitted = {}

@@ -90,7 +90,6 @@ def run_recovery_worker(db_path):
 def _review_provenance(conn, task):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_dispatch import _profile_exists_fn
-    from hermes_cli.profiles import profile_exists
     reviewer = kb._canonical_assignee(task.assignee)
     exists = _profile_exists_fn()
     if not reviewer or exists is None or not exists(reviewer):
@@ -100,7 +99,7 @@ def _review_provenance(conn, task):
     for row in rows:
         implementer = kb._canonical_assignee(row[1])
         if implementer and kb._retry_status_for_run(conn, task.id, row[0]) != "review":
-            if not profile_exists(implementer):
+            if not exists(implementer):
                 return None
             return implementer, reviewer
     return None
