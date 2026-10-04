@@ -458,13 +458,17 @@ _GOAL_GATE_MESSAGES = {
             "matching the card before requesting review.")}}
 
 
-def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
+def _goal_gate(tool_name: str, task, tid: str, evidence: str, *, conn=None) -> None:
     """Goal-mode pre-handoff judge gate: a worker must not complete / request
     review before acceptance criteria are met. ``blocked`` gets its own
     guidance; any other non-``done`` verdict gets the ``continue`` guidance.
     A broken judge fails open (logged) so it cannot permanently wedge work."""
     if not task or not task.goal_mode or not _goal_judge_available():
         return
+    from hermes_cli.kanban_acceptance_context import acceptance_context
+    phase = "review" if tool_name == "kanban_request_review" else "complete"
+    goal = (acceptance_context(conn, tid, phase=phase) if conn is not None
+            else f"{task.title}\n\n{task.body or ''}".strip())
     try:
         # Headless gate runs outside any agent turn: bind the per-task relay-affinity scope
         # (mirrors kanban_specify) so the relay does not reject the judge call (#113669).
@@ -472,7 +476,8 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
         try:
             verdict, reason, _, _, transport_failed = judge_goal(
-                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+                goal=goal, last_response=evidence.strip(),
+                **({"acceptance_context": goal} if conn is not None else {}))
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
@@ -709,7 +714,7 @@ def _handle_complete(args: dict, **kw) -> str:
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
         # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
-        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
+        _goal_gate("kanban_complete", task, tid, (summary or result or "").strip(), conn=conn)
         try:
             ok = kb.complete_task(
                 conn, tid, result=result, summary=summary, metadata=metadata,
@@ -840,7 +845,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                f"reviewer profile {reviewer!r} is not installed. "
                f"Installed profiles: {', '.join(list_profile_names())}")
     with _board(args.get("board")) as (kb, conn):
-        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
+        _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary, conn=conn)
         try:
             ok, fail_reason = kb.request_review(
                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
