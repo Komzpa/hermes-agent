@@ -13,6 +13,8 @@ from hermes_cli.kanban_recovery_review import reconcile_recovery_reviews
 
 @pytest.fixture
 def conn(tmp_path, monkeypatch):
+    import hermes_cli.profiles
+    monkeypatch.setattr(hermes_cli.profiles, "profile_exists", lambda _: True)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     kb.init_db()
     connection = kbc.connect()
@@ -21,7 +23,9 @@ def conn(tmp_path, monkeypatch):
 
 
 def blocked(conn, title="Retained implementation", body="Independent review required"):
-    tid = kb.create_task(conn, title=title, body=body, initial_status="blocked", goal_mode=True)
+    tid = kb.create_task(conn, title=title, body=body, assignee="implementer", goal_mode=True)
+    assert kb.claim_task(conn, tid) is not None
+    assert kb.block_task(conn, tid, reason="Independent review required")
     cid = kb.add_comment(conn, tid, "worker", "Implementation and test receipt retained")
     return tid, cid
 
@@ -235,12 +239,14 @@ def test_superseded_work_dispatches_native_review_not_implementation(conn, monke
         return review(cid)
 
     monkeypatch.setattr(recovery, "_judge", judge)
+    monkeypatch.setattr(recovery, "launch_recovery_review", lambda conn: reconcile_recovery_reviews(conn))
     spawned = []
 
     def spawn(task, workspace):
         spawned.append((task.id, list(task.skills or [])))
         return None
 
+    assert not kbd.dispatch_once(conn, spawn_fn=spawn).spawned
     result = kbd.dispatch_once(conn, spawn_fn=spawn)
     assert [row[0] for row in result.spawned] == [tid]
     assert spawned == [(tid, ["sdlc-review"])]
@@ -348,3 +354,220 @@ def test_oversized_contract_is_refused_not_silently_truncated(conn):
         acceptance_context(conn, tid)
     assert reconcile_recovery_reviews(conn, config=config(tid),
                                       judge=lambda _: pytest.fail("truncated contract")) == []
+
+
+def test_unassigned_recovery_cannot_park_in_unspawnable_review(conn):
+    tid, cid = blocked(conn)
+    assert kb.assign_task(conn, tid, None)
+    assert kb.get_task(conn, tid).assignee is None
+    reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: review(cid))
+    assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_recovery_retains_actual_implementer_not_current_reviewer(conn, monkeypatch):
+    import hermes_cli.config
+    import hermes_cli.profiles
+    monkeypatch.setattr(hermes_cli.profiles, "profile_exists", lambda _: True)
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda: {
+        "kanban": {"dispatch_profiles": ["reviewer"]}})
+    tid = kb.create_task(conn, title="Implemented by another profile",
+                         assignee="implementer")
+    task = kb.claim_task(conn, tid)
+    assert task.current_run_id is not None
+    assert kb.block_task(conn, tid, reason="Independent verification needed")
+    assert kb.assign_task(conn, tid, "reviewer")
+    cid = kb.add_comment(conn, tid, "implementer", "Retained implementation receipt")
+    reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: review(cid))
+    payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? "
+                                     "AND kind='review_requested' ORDER BY id DESC LIMIT 1",
+                                     (tid,)).fetchone()[0])
+    assert payload["implementer"] == "implementer"
+    assert payload["reviewer"] == "reviewer"
+    claimed = kb.claim_review_task(conn, tid)
+    assert claimed is not None
+    assert kb.request_changes(conn, tid, reason="Fix reproduced defect")[0]
+    assert kb.get_task(conn, tid).assignee == "implementer"
+
+
+def test_attachment_text_redacted_before_auxiliary_snapshot(conn, monkeypatch):
+    import hermes_cli.kanban_acceptance_context as context
+    tid, _ = blocked(conn)
+    with kb.write_txn(conn):
+        conn.execute("INSERT INTO task_attachments(task_id,filename,stored_path,size,created_at) "
+                     "VALUES(?,?,?,?,?)", (tid, "PRIVATE_FILENAME", "/home/PRIVATE_PROFILE/file", 1, 1))
+    monkeypatch.setattr(context, "redact_sensitive_text",
+                        lambda value, **kwargs: value.replace("PRIVATE_", "REDACTED_"))
+    encoded = json.dumps(acceptance_snapshot(conn, tid))
+    assert "PRIVATE_FILENAME" not in encoded
+    assert "PRIVATE_PROFILE" not in encoded
+
+
+def test_classifier_context_is_bounded_without_losing_contract_tail(conn, monkeypatch):
+    from types import SimpleNamespace
+    import agent.auxiliary_client
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, _ = blocked(conn, body="\u0436" * 7000 + "REQUIRED_TAIL")
+    for _ in range(8):
+        kb.add_comment(conn, tid, "worker", "history " * 200)
+    sent = []
+
+    def call(**kwargs):
+        sent.append(kwargs["messages"])
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content='{"decision":"wait","reason":"Needs evidence","evidence":[]}'))])
+
+    monkeypatch.setattr(agent.auxiliary_client, "call_llm", call)
+    recovery._judge(acceptance_snapshot(conn, tid))
+    user = next(m["content"] for m in sent[0] if m["role"] == "user")
+    assert len(user) <= 32000
+    assert "REQUIRED_TAIL" in user
+
+
+def test_shared_aggregate_budget_trims_history_without_mutating_snapshot(conn):
+    from hermes_cli.kanban_acceptance_context import snapshot_digest, snapshot_payload
+    tid, _ = blocked(conn, body="criterion " * 700 + "REQUIRED_TAIL")
+    for _ in range(8):
+        kb.add_comment(conn, tid, "worker", "history " * 200)
+    with kb.write_txn(conn):
+        for _ in range(5):
+            conn.execute("INSERT INTO task_runs(task_id,profile,status,started_at,summary,error,metadata) "
+                         "VALUES(?,?,?,?,?,?,?)", (tid, "implementer", "blocked", 1,
+                                                  "receipt " * 200, "error " * 300, "metadata " * 200))
+    snapshot = acceptance_snapshot(conn, tid)
+    before = snapshot_digest(snapshot)
+    assert len(json.dumps(snapshot)) > 32000
+    payload = snapshot_payload(snapshot)
+    assert len(payload) <= 32000
+    assert "REQUIRED_TAIL" in payload
+    assert json.loads(payload)["omitted_context_rows"]["runs"] > 0
+    assert snapshot_digest(snapshot) == before
+
+
+def test_transient_classifier_failure_does_not_permanently_cache_unchanged_task(conn, monkeypatch):
+    import time
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    tid, _ = blocked(conn)
+    calls = []
+
+    def judge(_):
+        calls.append(True)
+        if len(calls) == 1:
+            raise TimeoutError("transient synthetic provider timeout")
+        return {"decision": "wait", "reason": "External evidence needed", "evidence": []}
+
+    reconcile_recovery_reviews(conn, config=config(tid), judge=judge)
+    reconcile_recovery_reviews(conn, config=config(tid), judge=judge)
+    assert len(calls) == 1
+    now[0] += 301
+    reconcile_recovery_reviews(conn, config=config(tid), judge=judge)
+    assert len(calls) == 2
+    assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_slow_classification_never_precedes_unrelated_native_spawn(conn, monkeypatch):
+    import hermes_cli.config
+    import hermes_cli.profiles
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, _ = blocked(conn)
+    ready = kb.create_task(conn, title="Unrelated ready work", assignee="worker")
+    monkeypatch.setattr(hermes_cli.profiles, "profile_exists", lambda _: True)
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda *a, **k: {
+        "kanban": {"recovery_review": config(tid)}})
+    spawned = []
+    order = []
+
+    def classify(_):
+        order.append("classify")
+        return {"decision": "wait", "reason": "External evidence needed", "evidence": []}
+
+    monkeypatch.setattr(recovery, "_judge", classify)
+    monkeypatch.setattr(recovery, "launch_recovery_review", lambda conn: reconcile_recovery_reviews(conn))
+    def spawn(task, workspace):
+        order.append("spawn")
+        spawned.append(task.id)
+    kbd.dispatch_once(conn, spawn_fn=spawn)
+    assert ready in spawned
+    assert order == ["spawn", "classify"]
+
+
+def test_worker_launch_uses_isolated_actual_profile_and_board(conn, tmp_path, monkeypatch):
+    import hermes_cli.config
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, _ = blocked(conn)
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda: {
+        "kanban": {"recovery_review": config(tid)}})
+    calls = []
+    monkeypatch.setattr(recovery.subprocess, "Popen", lambda args, **kwargs: calls.append((args, kwargs)))
+    homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+    for home in (homes[0], homes[1], homes[0]):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        recovery.launch_recovery_review(conn)
+    assert [kwargs["env"]["HERMES_HOME"] for _, kwargs in calls] == [str(h) for h in
+                                                                 (homes[0], homes[1], homes[0])]
+    db_path = next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
+    assert all(args[-2:] == ["--db-path", db_path] for args, _ in calls)
+    assert all(args[1:3] == ["-m", "hermes_cli.kanban_recovery_review"] for args, _ in calls)
+
+
+def test_recovery_worker_lock_is_independent_and_singleton(conn, monkeypatch):
+    from pathlib import Path
+    import hermes_cli.config
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, _ = blocked(conn)
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda: {
+        "kanban": {"recovery_review": config(tid)}})
+    path = Path(next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"))
+    calls = []
+    monkeypatch.setattr(recovery, "_judge", lambda _: calls.append(True) or {
+        "decision": "wait", "reason": "Current external evidence needed", "evidence": []})
+    with kbc._dispatch_tick_lock(path.with_name(path.name + ".recovery")) as held:
+        assert held
+        assert recovery.run_recovery_worker(path) == []
+    assert not calls
+    with kbc._dispatch_tick_lock(path) as held:
+        assert held
+        assert recovery.run_recovery_worker(path)[0]["decision"] == "wait"
+    assert calls == [True]
+
+
+def test_worker_launch_failure_does_not_abort_native_claim(conn, monkeypatch):
+    import hermes_cli.kanban_recovery_review as recovery
+    tid = kb.create_task(conn, title="Ready work", assignee="implementer")
+    def fail(_):
+        raise OSError("synthetic subprocess launch failure")
+    monkeypatch.setattr(recovery, "launch_recovery_review", fail)
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *args: None)
+    assert result.spawned[0][0] == tid
+
+
+def test_recovery_disabled_during_classification_refuses_admission(conn):
+    tid, cid = blocked(conn)
+    cfg = config(tid)
+    def judge(_):
+        cfg["enabled"] = False
+        return review(cid)
+    assert reconcile_recovery_reviews(conn, config=cfg, judge=judge) == []
+    assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_real_worker_entrypoint_with_disabled_profile_never_calls_model(conn, tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    import hermes_cli.kanban_recovery_review as recovery
+    from hermes_cli.config import atomic_config_write
+    tid, _ = blocked(conn)
+    home = tmp_path / "disabled-worker-home"
+    home.mkdir()
+    atomic_config_write(home / "config.yaml", {"kanban": {"recovery_review": {"enabled": False}}})
+    path = next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
+    env = {**os.environ, "HERMES_HOME": str(home),
+           "PYTHONPATH": str(Path(recovery.__file__).resolve().parent.parent)}
+    result = subprocess.run([sys.executable, "-m", "hermes_cli.kanban_recovery_review",
+                             "--db-path", path], env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert kb.get_task(conn, tid).status == "blocked"
+    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? "
+                        "AND kind='recovery_review_checked'", (tid,)).fetchone()[0] == 0
