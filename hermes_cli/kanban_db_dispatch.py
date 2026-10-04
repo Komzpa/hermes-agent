@@ -1379,6 +1379,9 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
+    if infrastructure:
+        # Include disposition before any owner closes the run, not just in its event.
+        event_payload_extra = {**(event_payload_extra or {}), "infrastructure": True}
     with _kb.write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
