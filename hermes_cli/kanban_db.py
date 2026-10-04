@@ -2147,7 +2147,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
-def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
+def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None, *,
+                    exclude_task_ids=()) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
 
@@ -2162,6 +2163,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
+    excluded = set(exclude_task_ids)
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
@@ -2169,6 +2171,8 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
+            if task_id in excluded:
+                continue
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
