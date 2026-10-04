@@ -157,7 +157,8 @@ def test_both_handoff_consumers_use_current_shared_frame(conn, monkeypatch, modu
     import agent.auxiliary_client
     import hermes_cli.goals
     consumer = importlib.import_module(module)
-    tid, _ = blocked(conn)
+    tid, _ = blocked(conn, title="Legacy long title " * 30,
+                     body="Original required criterion. " * 350 + "REQUIRED_TAIL")
     task = kb.get_task(conn, tid)
     monkeypatch.setattr(agent.auxiliary_client, "get_text_auxiliary_client", lambda _: (object(), "judge"))
     goals = []
@@ -185,6 +186,7 @@ def test_both_handoff_consumers_use_current_shared_frame(conn, monkeypatch, modu
     assert "Fresh authoritative-source pointer" not in goals[0]
     assert "Fresh authoritative-source pointer" in goals[1]
     assert "Completion requires the full current task contract" in goals[1]
+    assert all("REQUIRED_TAIL" in frame for frame in goals)
 
 
 def test_goal_loop_refreshes_context_before_each_judgment(monkeypatch):
@@ -213,6 +215,41 @@ def test_missing_context_never_judges_done_or_spends_another_turn(monkeypatch):
         task_status_fn=lambda: "running", run_turn=lambda _: pytest.fail("turn called"),
         block_fn=lambda _: pytest.fail("block called"))
     assert result["outcome"] == "stopped"
+
+
+def test_overbudget_context_blocks_owned_run_without_judge_or_more_work(conn, monkeypatch):
+    from hermes_cli import goals
+    tid = kb.create_task(conn, title="Running work", body="Full criterion " * 3000,
+                         assignee="implementer", goal_mode=True)
+    task = kb.claim_task(conn, tid)
+    reasons = []
+
+    def block(reason):
+        reasons.append(reason)
+        assert kb.block_task(conn, tid, reason=reason, expected_run_id=task.current_run_id)
+
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: pytest.fail("judge called"))
+    result = goals.run_kanban_goal_loop(
+        task_id=tid, goal_text="old context", goal_context_fn=lambda: acceptance_context(conn, tid),
+        task_status_fn=lambda: "running", run_turn=lambda _: pytest.fail("turn called"),
+        block_fn=block)
+    assert result["outcome"] == "blocked_context"
+    assert kb.get_task(conn, tid).status == "blocked"
+    assert len(reasons) == 1
+
+
+def test_initial_cli_overbudget_context_finishes_owned_run_as_blocked(conn, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import cli_single_query, goals
+    tid = kb.create_task(conn, title="Initial running work", body="Full criterion " * 3000,
+                         assignee="implementer", goal_mode=True)
+    task = kb.claim_task(conn, tid)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", lambda **kwargs: pytest.fail("loop called"))
+    cli_single_query._run_kanban_goal_loop_q(SimpleNamespace(), "first response")
+    assert kb.get_task(conn, tid).status == "blocked"
+    assert conn.execute("SELECT status FROM task_runs WHERE id=?", (task.current_run_id,)).fetchone()[0] == "blocked"
 
 
 def test_live_claim_is_never_recovered(conn):
@@ -349,11 +386,84 @@ def test_judge_receives_full_contract_beyond_legacy_cutoff(conn, monkeypatch):
 
 
 def test_oversized_contract_is_refused_not_silently_truncated(conn):
-    tid, _ = blocked(conn, body="Required criterion. " * 500)
-    with pytest.raises(ValueError, match="contract body"):
+    tid, _ = blocked(conn, body="Required criterion. " * 2000)
+    with pytest.raises(ValueError, match="contract exceeds"):
         acceptance_context(conn, tid)
     assert reconcile_recovery_reviews(conn, config=config(tid),
                                       judge=lambda _: pytest.fail("truncated contract")) == []
+
+
+def test_legacy_long_contract_is_preserved_at_both_handoffs(conn):
+    title = ("Long retained task " * 30).strip()
+    body = "Required criterion. " * 500 + "REQUIRED_CONTRACT_TAIL"
+    tid, cid = blocked(conn, title=title, body=body)
+    for phase in ("review", "complete"):
+        frame = acceptance_context(conn, tid, phase=phase)
+        payload = json.loads(frame.split("\n")[-1])
+        assert payload["task"]["title"] == title
+        assert payload["task"]["body"] == body
+        assert len(frame) <= 32000
+    assert reconcile_recovery_reviews(conn, config=config(tid),
+                                      judge=lambda _: review(cid))[0]["decision"] == "review"
+
+
+@pytest.mark.parametrize("during_admission", [False, True])
+def test_unlisted_terminal_prerequisite_invalidates_cache_and_admission(conn, during_admission):
+    tid, cid = blocked(conn)
+    parents = [kb.create_task(conn, title=f"Prerequisite {index}") for index in range(33)]
+    for parent in parents:
+        kb.link_tasks(conn, parent, tid)
+    with kb.write_txn(conn):
+        conn.executemany("UPDATE tasks SET status='done' WHERE id=?", [(p,) for p in parents])
+    hidden = sorted(parents)[-1]
+    assert hidden not in {p["id"] for p in acceptance_snapshot(conn, tid)["prerequisites"]}
+    calls = []
+
+    def judge(_):
+        calls.append(True)
+        if during_admission:
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (hidden,))
+            return review(cid)
+        return {"decision": "wait", "reason": "Retained evidence needs verification", "evidence": []}
+
+    reconcile_recovery_reviews(conn, config=config(tid), judge=judge)
+    if during_admission:
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? "
+                                "AND kind='recovery_review_checked'", (tid,)).fetchone()
+    else:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (hidden,))
+        reconcile_recovery_reviews(conn, config=config(tid), judge=judge)
+        assert len(calls) == 2
+
+
+def test_valid_decision_operational_failure_retries_without_mutation(conn, monkeypatch):
+    import sqlite3
+    import time
+    import hermes_cli.kanban_recovery_review as recovery
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    tid, cid = blocked(conn)
+    original = recovery._review_provenance
+    calls = []
+
+    def provenance(*args):
+        calls.append(True)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("synthetic temporary SQLite admission failure")
+        return original(*args)
+
+    monkeypatch.setattr(recovery, "_review_provenance", provenance)
+    result = reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: review(cid))
+    assert result[0]["decision"] == "error"
+    assert kb.get_task(conn, tid).status == "blocked"
+    assert reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: review(cid)) == []
+    now[0] += 301
+    result = reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: review(cid))
+    assert result[0]["decision"] == "review"
+    assert len(calls) == 2
 
 
 def test_unassigned_recovery_cannot_park_in_unspawnable_review(conn):
@@ -508,6 +618,40 @@ def test_worker_launch_uses_isolated_actual_profile_and_board(conn, tmp_path, mo
     db_path = next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
     assert all(args[-2:] == ["--db-path", db_path] for args, _ in calls)
     assert all(args[1:3] == ["-m", "hermes_cli.kanban_recovery_review"] for args, _ in calls)
+
+
+def test_worker_launch_multiplex_credentials_follow_target_a_b_a(conn, tmp_path, monkeypatch):
+    from agent import secret_scope as secrets
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    import hermes_cli.config
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, _ = blocked(conn)
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda: {
+        "kanban": {"recovery_review": config(tid)}})
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+        (home / ".env").write_text(f"OPENAI_API_KEY=synthetic-owned-{home.name}\n")
+    monkeypatch.setenv("HERMES_HOME", str(homes[0]))
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-launch-residue")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-unowned-launch")
+    calls = []
+    monkeypatch.setattr(recovery.subprocess, "Popen", lambda args, **kwargs: calls.append(kwargs["env"]))
+    was_multiplex = secrets.is_multiplex_active()
+    secrets.set_multiplex_active(True)
+    try:
+        for home in (homes[0], homes[1], homes[0]):
+            token = set_hermes_home_override(home)
+            try:
+                recovery.launch_recovery_review(conn)
+            finally:
+                reset_hermes_home_override(token)
+    finally:
+        secrets.set_multiplex_active(was_multiplex)
+    assert [env["HERMES_HOME"] for env in calls] == [str(h) for h in (homes[0], homes[1], homes[0])]
+    assert [env.get("OPENAI_API_KEY") for env in calls] == [
+        "synthetic-owned-a", "synthetic-owned-b", "synthetic-owned-a"]
+    assert "ANTHROPIC_API_KEY" not in calls[1]
 
 
 def test_recovery_worker_lock_is_independent_and_singleton(conn, monkeypatch):
