@@ -34,6 +34,8 @@ Attachment filenames are bounded and redacted; absolute stored paths are not
 included in auxiliary input. Both classifier and goal judge use the same
 aggregate context budget, preserving the full contract and labelling omitted
 historical rows. Neither reads arbitrary local artifacts.
+Operational claim locks and worker PIDs remain in the local snapshot for
+staleness checks, but are omitted from both auxiliary prompt payloads.
 Legacy long titles and bodies are not rejected by per-field caps: only the shared
 aggregate budget applies. A contract that cannot fit intact blocks its owning
 goal-mode run rather than silently truncating criteria or stranding a running card.
