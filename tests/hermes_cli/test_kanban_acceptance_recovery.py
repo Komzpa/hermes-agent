@@ -183,6 +183,20 @@ def test_only_empty_run_cannot_supply_implementation_provenance(conn):
     assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_infrastructure_failure_keeps_run_evidence_and_native_cooldown(conn, monkeypatch):
+    tid = kb.create_task(conn, title="Synthetic unavailable scope", assignee="implementer")
+    run_id = kb.claim_task(conn, tid).current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "120")
+    assert not kbd._record_task_failure(conn, tid, "Synthetic scope unavailable",
+                                       outcome="spawn_failed", infrastructure=True,
+                                       release_claim=True, end_run=True)
+    row = conn.execute("SELECT outcome,metadata FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    assert row[0] == "spawn_failed"
+    assert json.loads(row[1])["infrastructure"] is True
+    assert kb.get_task(conn, tid).consecutive_failures == 0
+    assert kbd.check_respawn_guard(conn, tid) == "infrastructure_cooldown"
+
+
 def test_snapshot_preserves_contract_and_attributed_later_evidence(conn):
     tid, cid = blocked(conn, body="Original acceptance; no unauthorized rollout")
     kb.add_comment(conn, tid, "owner", "Later authorized rollout receipt; verify original source")
