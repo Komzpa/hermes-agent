@@ -85,6 +85,8 @@ def snapshot_digest(snapshot):
 
 def snapshot_payload(snapshot, *, prefix=""):
     snapshot = deepcopy(snapshot)
+    for field in ("claim_lock", "worker_pid"):
+        snapshot["task"].pop(field, None)
     omitted = {}
     while True:
         encoded = json.dumps(snapshot, ensure_ascii=False)

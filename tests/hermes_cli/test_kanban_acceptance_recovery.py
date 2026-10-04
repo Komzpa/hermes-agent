@@ -553,6 +553,27 @@ def test_shared_aggregate_budget_trims_history_without_mutating_snapshot(conn):
     assert snapshot_digest(snapshot) == before
 
 
+def test_operational_claim_identity_stays_local_to_staleness_checks(conn):
+    from hermes_cli.kanban_acceptance_context import snapshot_digest, snapshot_payload
+    tid, _ = blocked(conn)
+    claim = "synthetic-private-host:991234567"
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET claim_lock=?,worker_pid=? WHERE id=?",
+                     (claim, 991234567, tid))
+    snapshot = acceptance_snapshot(conn, tid)
+    before = snapshot_digest(snapshot)
+    for prompt in (snapshot_payload(snapshot), acceptance_context(conn, tid)):
+        assert "claim_lock" not in prompt
+        assert "worker_pid" not in prompt
+        assert "synthetic-private-host" not in prompt
+        assert "991234567" not in prompt
+    assert snapshot["task"]["claim_lock"] == claim
+    assert snapshot["task"]["worker_pid"] == 991234567
+    assert snapshot_digest(snapshot) == before
+    assert reconcile_recovery_reviews(conn, config=config(tid),
+                                      judge=lambda _: pytest.fail("live claim classified")) == []
+
+
 def test_transient_classifier_failure_does_not_permanently_cache_unchanged_task(conn, monkeypatch):
     import time
     now = [time.time()]
