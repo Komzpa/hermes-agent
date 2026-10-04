@@ -159,6 +159,10 @@ class TestCLIJudgeGate:
             body="acceptance: criteria",
         )
         fake_conn = MagicMock()
+        monkeypatch.setattr(
+            "hermes_cli.kanban_acceptance_context.acceptance_context",
+            lambda conn, tid, **kw: "Finish report: acceptance criteria",
+        )
         complete_calls: list = []
 
         def fake_connect_closing():
