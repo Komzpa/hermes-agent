@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import signal
@@ -26,6 +27,8 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -1973,12 +1976,6 @@ def dispatch_once(
     ``skipped_locked=True`` and writes no claim tick state; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
     """
-    if not dry_run:
-        # Semantic verification must never hold the dispatcher's board lock.
-        # Recovery owns a separate native write transaction with snapshot CAS.
-        from hermes_cli.kanban_recovery_review import reconcile_recovery_reviews
-        reconcile_recovery_reviews(conn)
-
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
@@ -2001,6 +1998,8 @@ def dispatch_once(
         # Must not lose the tick — fall through to an unguarded dispatch.
         result = _locked_tick()
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        if not dry_run:
+            _launch_recovery_review(conn)
         return result
     with _kbc._dispatch_tick_lock(db_path) as held:
         if not held:
@@ -2012,7 +2011,17 @@ def dispatch_once(
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    if not dry_run and not result.skipped_locked:
+        _launch_recovery_review(conn)
     return result
+
+
+def _launch_recovery_review(conn):
+    from hermes_cli.kanban_recovery_review import launch_recovery_review
+    try:
+        launch_recovery_review(conn)
+    except Exception:
+        logger.exception("kanban recovery worker launch failed; claim tick is unaffected")
 
 
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
