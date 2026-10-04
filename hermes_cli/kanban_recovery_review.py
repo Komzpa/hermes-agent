@@ -13,7 +13,7 @@ from pathlib import Path
 from hermes_cli.kanban_acceptance_context import acceptance_snapshot, snapshot_digest, snapshot_payload
 
 logger = logging.getLogger(__name__)
-_POLICY_VERSION = 2
+_POLICY_VERSION = 3
 _ERROR_RETRY_SECONDS = 300
 
 _SYSTEM = """Classify whether this inactive Kanban task has an existing implementation
@@ -59,14 +59,14 @@ def _scope(conn, roots):
 def launch_recovery_review(conn):
     from hermes_cli.config import load_config
     from hermes_constants import get_hermes_home
+    from tools.environments.local import served_profile_child_env
     config = ((load_config() or {}).get("kanban") or {}).get("recovery_review") or {}
     if not isinstance(config, dict) or config.get("enabled") is not True:
         return
     paths = [row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"]
     if not paths or not paths[0]:
         return
-    env = dict(os.environ)
-    env["HERMES_HOME"] = str(get_hermes_home())
+    env = served_profile_child_env(target_home=get_hermes_home(), inherit_credentials=True)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (
         str(Path(__file__).resolve().parent.parent), env.get("PYTHONPATH"))))
     subprocess.Popen([sys.executable, "-m", "hermes_cli.kanban_recovery_review",
@@ -133,6 +133,7 @@ def reconcile_recovery_reviews(conn, *, config=None, judge=None):
             continue
         try:
             snapshot = acceptance_snapshot(conn, task_id)
+            snapshot_payload(snapshot)
         except ValueError:
             continue
         if not snapshot["prerequisites_satisfied"]:
@@ -152,6 +153,7 @@ def reconcile_recovery_reviews(conn, *, config=None, judge=None):
                 pass
         attempts += 1
         decision_received = False
+        decision_validated = False
         routing_unavailable = False
         try:
             decision = (judge or _judge)(snapshot)
@@ -172,6 +174,7 @@ def reconcile_recovery_reviews(conn, *, config=None, judge=None):
                     raise ValueError("recovery cited missing or foreign evidence")
             if decision["decision"] == "review" and not evidence:
                 raise ValueError("review requires a retained evidence reference")
+            decision_validated = True
             provenance = _review_provenance(conn, task) if decision["decision"] == "review" else None
             if decision["decision"] == "review" and provenance is None:
                 routing_unavailable = True
@@ -225,7 +228,7 @@ def reconcile_recovery_reviews(conn, *, config=None, judge=None):
                     payload = {"snapshot_sha256": digest, "policy_version": _POLICY_VERSION,
                                "decision": "error",
                                "reason": type(exc).__name__}
-                    if not decision_received:
+                    if not decision_received or decision_validated:
                         payload["retry_after_epoch"] = int(time.time()) + _ERROR_RETRY_SECONDS
                     kb._append_event(conn, task_id, "recovery_review_checked", payload)
                     outcomes.append({"task_id": task_id, **payload})

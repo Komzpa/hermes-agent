@@ -34,11 +34,18 @@ Attachment filenames are bounded and redacted; absolute stored paths are not
 included in auxiliary input. Both classifier and goal judge use the same
 aggregate context budget, preserving the full contract and labelling omitted
 historical rows. Neither reads arbitrary local artifacts.
+Legacy long titles and bodies are not rejected by per-field caps: only the shared
+aggregate budget applies. A contract that cannot fit intact blocks its owning
+goal-mode run rather than silently truncating criteria or stranding a running card.
+The bounded prerequisite list is backed by a digest of every native edge and status,
+so changes beyond its first 32 rows invalidate cached and in-flight decisions too.
 
 The dispatcher records `recovery_review_checked` with the snapshot digest and
 decision and policy version. Unchanged successful decisions and invalid response
 schemas are not rejudged. Transport failures and unavailable review routing
 retry after a five-minute cooldown rather than permanently caching failure.
+Operational admission failures after a schema-valid response use that same cooldown;
+invalid schemas remain fail-closed until their input or policy version changes.
 New material board evidence changes its version
 and permits another pass. External state changes alone do not change this
 snapshot: their refreshed receipts must be recorded by the existing evidence
@@ -50,7 +57,10 @@ Disabling recovery or removing its configured scope during a model call also
 refuses admission. Dry-run dispatch does not invoke recovery or write audit events.
 
 After the normal claim tick, the dispatcher launches an isolated profile-local
-recovery process with the exact existing board path. A separate singleton lock
+recovery process with the exact existing board path.
+The canonical served-profile child environment supplies only the target profile's
+owned credentials when routing between profiles, never the launch profile's residue.
+Its existing permission scope is unchanged. A separate singleton lock
 serializes recovery passes; provider waits do not hold the dispatch lock or
 delay ordinary reclaim/claim/spawn work. Native review admission uses its own
 short transaction and is available to the next normal dispatcher pass.

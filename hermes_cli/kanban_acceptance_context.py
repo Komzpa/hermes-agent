@@ -11,6 +11,10 @@ from agent.redact import redact_sensitive_text
 MAX_ACCEPTANCE_CONTEXT_CHARS = 32000
 
 
+class AcceptanceContextTooLarge(ValueError):
+    """The current contract cannot fit without dropping acceptance criteria."""
+
+
 def _rows(conn, sql, params=()):
     cursor = conn.execute(sql, params)
     keys = [column[0] for column in cursor.description]
@@ -30,12 +34,8 @@ def acceptance_snapshot(conn, task_id):
     if not tasks:
         raise ValueError("unknown task")
     task = tasks[0]
-    for field, limit in (("title", 400), ("body", 8000), ("completion_contract", 8000)):
-        if len(str(task[field] or "")) > limit:
-            raise ValueError(f"acceptance contract {field} exceeds safe context budget")
-    task["title"] = _text(task["title"], 400)
-    task["body"] = _text(task["body"], 8000)
-    task["completion_contract"] = _text(task["completion_contract"], 8000)
+    for field in ("title", "body", "completion_contract"):
+        task[field] = redact_sensitive_text(str(task[field] or ""), force=True)
     comments = _rows(conn, "SELECT id,author,created_at,body FROM task_comments "
                      "WHERE task_id=? ORDER BY id DESC LIMIT 8", (task_id,))[::-1]
     for comment in comments:
@@ -57,6 +57,13 @@ def acceptance_snapshot(conn, task_id):
                           "ORDER BY t.id LIMIT 32", (task_id,))
     for prerequisite in prerequisites:
         prerequisite["title"] = _text(prerequisite["title"], 400)
+    # Prompt rows are bounded; every edge and status still participates in versioning.
+    prerequisite_digest = hashlib.sha256()
+    for row in conn.execute("SELECT l.parent_id,t.status FROM task_links l "
+                            "LEFT JOIN tasks t ON t.id=l.parent_id WHERE l.child_id=? "
+                            "ORDER BY l.parent_id", (task_id,)):
+        prerequisite_digest.update(json.dumps(tuple(row), ensure_ascii=True).encode())
+        prerequisite_digest.update(b"\n")
     prerequisites_satisfied = conn.execute(
         "SELECT 1 FROM task_links l JOIN tasks t ON t.id=l.parent_id "
         "WHERE l.child_id=? AND t.status NOT IN ('done','archived') LIMIT 1",
@@ -66,6 +73,7 @@ def acceptance_snapshot(conn, task_id):
     for attachment in attachments:
         attachment["filename"] = _text(attachment["filename"], 400)
     return {"task": task, "prerequisites": prerequisites,
+            "prerequisite_set_sha256": prerequisite_digest.hexdigest(),
             "prerequisites_satisfied": prerequisites_satisfied, "comments": comments,
             "runs": runs, "events": events, "attachments": attachments}
 
@@ -85,7 +93,7 @@ def snapshot_payload(snapshot, *, prefix=""):
         section = next((key for key in ("runs", "comments", "events", "attachments", "prerequisites")
                         if snapshot[key]), None)
         if section is None:
-            raise ValueError("acceptance contract exceeds safe context budget")
+            raise AcceptanceContextTooLarge("acceptance contract exceeds safe context budget")
         snapshot[section].pop(0)
         omitted[section] = omitted.get(section, 0) + 1
         snapshot["omitted_context_rows"] = omitted
