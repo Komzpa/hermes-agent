@@ -2217,7 +2217,13 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    from hermes_cli.kanban_recovery_review import pending_recovery_tasks
+    pending = pending_recovery_tasks(conn)
+    if pending:
+        result.promoted = _kb.recompute_ready(
+            conn, failure_limit=failure_limit, exclude_task_ids=pending)
+    else:
+        result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
 def _tick_spawn_budget(

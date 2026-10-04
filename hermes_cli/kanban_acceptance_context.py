@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
+from pathlib import PurePosixPath, PureWindowsPath
 
 from agent.redact import redact_sensitive_text
 
@@ -24,6 +25,28 @@ def _rows(conn, sql, params=()):
 def _text(value, limit=1200):
     value = redact_sensitive_text(str(value or ""), force=True)
     return value if len(value) <= limit else value[:limit] + " [truncated]"
+
+
+def _metadata_text(value):
+    def references_only(item):
+        if isinstance(item, dict):
+            return {key: references_only(val) for key, val in item.items()}
+        if isinstance(item, list):
+            return [references_only(val) for val in item]
+        if isinstance(item, str):
+            for path_type in (PurePosixPath, PureWindowsPath):
+                path = path_type(item)
+                if path.is_absolute():
+                    return "[local artifact] " + path.name
+        return item
+
+    if not value:
+        return ""
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return "[unstructured metadata omitted]"
+    return _text(json.dumps(references_only(parsed), ensure_ascii=False))
 
 
 def _version_rows(digest, section, rows):
@@ -53,15 +76,16 @@ def acceptance_snapshot(conn, task_id):
                  "FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 5", (task_id,))[::-1]
     _version_rows(local_evidence_digest, "runs", runs)
     for run in runs:
-        for field in ("summary", "error", "metadata"):
+        for field in ("summary", "error"):
             run[field] = _text(run[field])
+        run["metadata"] = _metadata_text(run["metadata"])
     events = _rows(conn, "SELECT id,kind,created_at,payload FROM task_events "
                    "WHERE task_id=? AND kind IN ('created','edited','blocked',"
                    "'review_requested','changes_requested','completed','archived') "
                    "ORDER BY id DESC LIMIT 5", (task_id,))[::-1]
     _version_rows(local_evidence_digest, "events", events)
     for event in events:
-        event["payload"] = _text(event["payload"])
+        event["payload"] = _metadata_text(event["payload"])
     # Native edges are prerequisite -> dependent, including decomposition roots.
     prerequisites = _rows(conn, "SELECT t.id,t.title,t.status FROM task_links l "
                           "JOIN tasks t ON t.id=l.parent_id WHERE l.child_id=? "
@@ -81,7 +105,7 @@ def acceptance_snapshot(conn, task_id):
         "WHERE l.child_id=? AND t.status NOT IN ('done','archived') LIMIT 1",
         (task_id,)).fetchone() is None
     attachments = _rows(conn, "SELECT id,filename,size,created_at "
-                        "FROM task_attachments WHERE task_id=? ORDER BY id DESC LIMIT 5", (task_id,))
+                        "FROM task_attachments WHERE task_id=? ORDER BY id DESC LIMIT 5", (task_id,))[::-1]
     _version_rows(local_evidence_digest, "attachments", attachments)
     for attachment in attachments:
         attachment["filename"] = _text(attachment["filename"], 400)

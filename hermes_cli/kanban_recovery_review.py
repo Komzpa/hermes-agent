@@ -13,7 +13,7 @@ from pathlib import Path
 from hermes_cli.kanban_acceptance_context import acceptance_snapshot, snapshot_digest, snapshot_payload
 
 logger = logging.getLogger(__name__)
-_POLICY_VERSION = 3
+_POLICY_VERSION = 4
 _ERROR_RETRY_SECONDS = 300
 
 _SYSTEM = """Classify whether this inactive Kanban task has an existing implementation
@@ -94,15 +94,62 @@ def _review_provenance(conn, task):
     exists = _profile_exists_fn()
     if not reviewer or exists is None or not exists(reviewer):
         return None
-    rows = conn.execute("SELECT id,profile FROM task_runs WHERE task_id=? "
+    rows = conn.execute("SELECT id,profile,outcome,summary,metadata,ended_at FROM task_runs WHERE task_id=? "
                         "AND profile IS NOT NULL ORDER BY id DESC LIMIT 32", (task.id,))
     for row in rows:
+        if row[5] is None or row[2] not in ("completed", "review_requested", "blocked"):
+            continue
+        try:
+            metadata = json.loads(row[4] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        artifacts = metadata.get("artifacts") if isinstance(metadata, dict) else None
+        has_artifacts = isinstance(artifacts, list) and any(
+            isinstance(path, str) and path.strip() for path in artifacts)
+        if not str(row[3] or "").strip() and not has_artifacts:
+            continue
         implementer = kb._canonical_assignee(row[1])
         if implementer and kb._retry_status_for_run(conn, task.id, row[0]) != "review":
             if not exists(implementer):
                 return None
             return implementer, reviewer
     return None
+
+
+def pending_recovery_tasks(conn):
+    """Reserve opt-in inactive candidates before promotion, without calling a model."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.config import load_config
+    config = ((load_config() or {}).get("kanban") or {}).get("recovery_review") or {}
+    if not isinstance(config, dict) or config.get("enabled") is not True:
+        return set()
+    roots = config.get("root_tasks")
+    if not isinstance(roots, list) or not roots or not all(isinstance(x, str) for x in roots):
+        return set()
+    pending = set()
+    for task_id in _scope(conn, roots):
+        task = kb.get_task(conn, task_id)
+        if (not task or task.status not in ("todo", "blocked") or task.claim_lock
+                or task.current_run_id is not None or task.worker_pid):
+            continue
+        snapshot = acceptance_snapshot(conn, task_id)
+        if not snapshot["prerequisites_satisfied"]:
+            continue
+        previous = conn.execute("SELECT payload FROM task_events WHERE task_id=? "
+                                "AND kind='recovery_review_checked' ORDER BY id DESC LIMIT 1",
+                                (task_id,)).fetchone()
+        if previous:
+            try:
+                cached = json.loads(previous[0])
+                if (cached.get("snapshot_sha256") == snapshot_digest(snapshot)
+                        and cached.get("policy_version") == _POLICY_VERSION
+                        and cached.get("decision") == "wait"
+                        and cached.get("retry_after_epoch") is None):
+                    continue
+            except (TypeError, ValueError):
+                pass
+        pending.add(task_id)
+    return pending
 
 
 def reconcile_recovery_reviews(conn, *, config=None, judge=None):
