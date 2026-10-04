@@ -135,6 +135,72 @@ def test_state_change_during_model_call_rejects_stale_admission(conn):
     assert kb.get_task(conn, tid).status == "blocked"
 
 
+@pytest.mark.parametrize("during_call", [False, True])
+def test_raw_contract_change_invalidates_redacted_recovery_decision(conn, during_call):
+    from hermes_cli.kanban_acceptance_context import snapshot_payload
+    tid, cid = blocked(conn, body="API_KEY=alpha123")
+    calls = []
+    before = snapshot_payload(acceptance_snapshot(conn, tid))
+
+    def edit():
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET body=? WHERE id=?", ("API_KEY=bravo456", tid))
+
+    def judge(snapshot):
+        calls.append(snapshot)
+        if during_call:
+            edit()
+            return review(cid)
+        return {"decision": "wait", "reason": "Needs evidence", "evidence": []}
+
+    result = reconcile_recovery_reviews(conn, config=config(tid), judge=judge)
+    if during_call:
+        assert result == []
+        assert kb.get_task(conn, tid).status == "blocked"
+    else:
+        edit()
+        reconcile_recovery_reviews(conn, config=config(tid), judge=judge)
+        assert len(calls) == 2
+    after = snapshot_payload(acceptance_snapshot(conn, tid))
+    assert after == before
+    assert "alpha123" not in after and "bravo456" not in after
+
+
+def test_recovery_refuses_allowlist_excluded_return_implementer(conn, monkeypatch):
+    import hermes_cli.config_effective
+    monkeypatch.setattr(hermes_cli.config_effective, "load_user_config_effective",
+                        lambda **kwargs: {"kanban": {"dispatch_profiles": ["reviewer"]}})
+    tid, cid = blocked(conn)
+    assert kb.assign_task(conn, tid, "reviewer")
+    result = reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: review(cid))
+    assert result[0]["decision"] == "wait"
+    assert kb.get_task(conn, tid).status == "blocked"
+    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? "
+                        "AND kind='review_requested'", (tid,)).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("table,field", [
+    ("task_comments", "body"), ("task_runs", "metadata"),
+    ("task_events", "payload"), ("task_attachments", "filename"),
+])
+def test_raw_evidence_versions_remain_local_before_redaction(conn, table, field):
+    from hermes_cli.kanban_acceptance_context import snapshot_digest, snapshot_payload
+    tid, _ = blocked(conn)
+    with kb.write_txn(conn):
+        conn.execute("INSERT INTO task_attachments(task_id,filename,stored_path,size,created_at) "
+                     "VALUES(?,?,?,?,?)", (tid, "synthetic", "/synthetic-only", 1, 1))
+        conn.execute(f"UPDATE {table} SET {field}=? WHERE task_id=?", ("API_KEY=alpha123", tid))
+    before = acceptance_snapshot(conn, tid)
+    with kb.write_txn(conn):
+        conn.execute(f"UPDATE {table} SET {field}=? WHERE task_id=?", ("API_KEY=bravo456", tid))
+    after = acceptance_snapshot(conn, tid)
+    assert snapshot_digest(before) != snapshot_digest(after)
+    assert snapshot_payload(before) == snapshot_payload(after)
+    for payload in (snapshot_payload(before), snapshot_payload(after)):
+        assert "_local_evidence_sha256" not in payload
+        assert "alpha123" not in payload and "bravo456" not in payload
+
+
 def test_recovery_disabled_does_not_call_model_or_change_board(conn):
     tid, _ = blocked(conn)
     assert reconcile_recovery_reviews(conn, config={}, judge=lambda _: pytest.fail("called")) == []
@@ -475,11 +541,11 @@ def test_unassigned_recovery_cannot_park_in_unspawnable_review(conn):
 
 
 def test_recovery_retains_actual_implementer_not_current_reviewer(conn, monkeypatch):
-    import hermes_cli.config
+    import hermes_cli.config_effective
     import hermes_cli.profiles
     monkeypatch.setattr(hermes_cli.profiles, "profile_exists", lambda _: True)
-    monkeypatch.setattr(hermes_cli.config, "load_config", lambda: {
-        "kanban": {"dispatch_profiles": ["reviewer"]}})
+    monkeypatch.setattr(hermes_cli.config_effective, "load_user_config_effective", lambda **kwargs: {
+        "kanban": {"dispatch_profiles": ["reviewer", "implementer"]}})
     tid = kb.create_task(conn, title="Implemented by another profile",
                          assignee="implementer")
     task = kb.claim_task(conn, tid)
