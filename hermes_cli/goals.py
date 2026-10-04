@@ -1689,10 +1689,15 @@ def run_kanban_goal_loop(
             return _result("stopped", f"status={status}")
 
         if goal_context_fn is not None:
+            from hermes_cli.kanban_acceptance_context import AcceptanceContextTooLarge
             try:
                 goal_text = goal_context_fn()
                 if not isinstance(goal_text, str) or not goal_text.strip():
                     raise ValueError("empty current acceptance context")
+            except AcceptanceContextTooLarge:
+                _block("Current acceptance contract exceeds the safe judge context budget; "
+                       "all criteria must be retained before verification")
+                return _result("blocked_context", "current acceptance contract exceeds context budget")
             except Exception as exc:
                 _log(f"kanban goal loop: acceptance context unavailable ({exc}); stopping")
                 return _result("stopped", "current acceptance context unavailable")
