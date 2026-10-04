@@ -39,6 +39,150 @@ def review(cid):
             "evidence": [{"kind": "comment", "id": cid}]}
 
 
+def test_native_artifact_paths_stay_local_in_run_and_event_metadata(conn):
+    from hermes_cli.kanban_acceptance_context import snapshot_digest, snapshot_payload
+    tid, _ = blocked(conn)
+    artifact = "/home/private-owner/project/receipt.txt"
+    metadata = json.dumps({"artifacts": [artifact], "nested": {"stored_path": artifact},
+                           "receipt": "verified"})
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?", (metadata, tid))
+        kb._append_event(conn, tid, "review_requested", {"metadata": json.loads(metadata)})
+    before = acceptance_snapshot(conn, tid)
+    payload = snapshot_payload(before)
+    assert artifact not in payload
+    assert "receipt.txt" in payload and "verified" in payload
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?",
+                     (metadata.replace("private-owner", "other-owner"), tid))
+    after = acceptance_snapshot(conn, tid)
+    assert snapshot_digest(before) != snapshot_digest(after)
+    assert snapshot_payload(before) == snapshot_payload(after)
+
+
+def test_budget_keeps_newest_attachment(conn, monkeypatch):
+    import hermes_cli.kanban_acceptance_context as context
+    tid, _ = blocked(conn)
+    with kb.write_txn(conn):
+        for filename in ("old.txt", "new.txt"):
+            conn.execute("INSERT INTO task_attachments(task_id,filename,stored_path,size,created_at) "
+                         "VALUES(?,?,?,?,?)", (tid, filename, "/synthetic", 1, 1))
+    snapshot = acceptance_snapshot(conn, tid)
+    # Remove older history so the budget exercises attachment eviction itself.
+    for section in ("runs", "comments", "events", "prerequisites"):
+        snapshot[section] = []
+    expected = json.loads(context.snapshot_payload(snapshot))
+    expected["attachments"] = [next(row for row in expected["attachments"]
+                                    if row["filename"] == "new.txt")]
+    expected["omitted_context_rows"] = {"attachments": 1}
+    monkeypatch.setattr(context, "MAX_ACCEPTANCE_CONTEXT_CHARS", len(json.dumps(expected)))
+    payload = json.loads(context.snapshot_payload(snapshot))
+    assert [row["filename"] for row in payload["attachments"]] == ["new.txt"]
+
+
+@pytest.mark.parametrize("outcome,summary", [
+    ("spawn_failed", "Spawn failed before work"), ("timed_out", "Timed out before work"),
+    ("blocked", None),
+])
+def test_recovery_skips_failed_or_empty_return_implementer(conn, outcome, summary):
+    tid, cid = blocked(conn)
+    kb.assign_task(conn, tid, "reviewer")
+    with kb.write_txn(conn):
+        conn.execute("INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome,summary) "
+                     "VALUES(?,?,?,?,?,?,?)", (tid, "wrong-implementer", "blocked", 1, 2, outcome, summary))
+    result = reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: review(cid))
+    assert result[0]["decision"] == "review"
+    event = conn.execute("SELECT payload FROM task_events WHERE task_id=? "
+                         "AND kind='review_requested' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+    assert json.loads(event[0])["implementer"] == "implementer"
+
+
+@pytest.mark.parametrize("status", ["todo", "blocked"])
+def test_pending_recovery_reserves_inactive_work_before_normal_spawn(conn, monkeypatch, status):
+    import hermes_cli.config
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, cid = blocked(conn)
+    kb.assign_task(conn, tid, "reviewer")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+        conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='blocked'", (tid,))
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda *a, **k: {
+        "kanban": {"recovery_review": config(tid), "review_dispatch": True}})
+    # Real asynchronous child has not yet returned a decision.
+    monkeypatch.setattr(recovery, "launch_recovery_review", lambda conn: None)
+    spawned = []
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *args: spawned.append(args))
+    assert spawned == [] and not result.spawned
+    assert kb.get_task(conn, tid).status == status
+    reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: review(cid))
+    assert kb.get_task(conn, tid).status == "review"
+
+
+@pytest.mark.parametrize("enabled,in_scope", [(False, True), (True, False)])
+def test_recovery_reservation_does_not_hold_unrelated_queue(conn, monkeypatch, enabled, in_scope):
+    import hermes_cli.config
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, _ = blocked(conn)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+    cfg = config(tid if in_scope else "missing-root")
+    cfg["enabled"] = enabled
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda *a, **k: {
+        "kanban": {"recovery_review": cfg}})
+    monkeypatch.setattr(recovery, "launch_recovery_review", lambda conn: None)
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *args: None)
+    assert [row[0] for row in result.spawned] == [tid]
+
+
+@pytest.mark.parametrize("error", [False, True])
+def test_recovery_wait_releases_promotion_but_retryable_error_does_not(conn, monkeypatch, error):
+    import hermes_cli.config
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, _ = blocked(conn)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda *a, **k: {
+        "kanban": {"recovery_review": config(tid)}})
+    monkeypatch.setattr(recovery, "launch_recovery_review", lambda conn: None)
+
+    def judge(_):
+        if error:
+            raise TimeoutError("Synthetic provider unavailable")
+        return {"decision": "wait", "reason": "No implementation to review", "evidence": []}
+
+    reconcile_recovery_reviews(conn, config=config(tid), judge=judge)
+    result = kbd.dispatch_once(conn, spawn_fn=lambda *args: None)
+    if error:
+        assert not result.spawned
+        assert kb.get_task(conn, tid).status == "todo"
+    else:
+        assert [row[0] for row in result.spawned] == [tid]
+
+
+def test_new_evidence_reserves_previously_declined_recovery(conn, monkeypatch):
+    import hermes_cli.config
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, _ = blocked(conn)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda *a, **k: {
+        "kanban": {"recovery_review": config(tid)}})
+    reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: {
+        "decision": "wait", "reason": "No implementation to review", "evidence": []})
+    kb.add_comment(conn, tid, "worker", "New implementation receipt")
+    monkeypatch.setattr(recovery, "launch_recovery_review", lambda conn: None)
+    assert not kbd.dispatch_once(conn, spawn_fn=lambda *args: pytest.fail("duplicate work")).spawned
+
+
+def test_only_empty_run_cannot_supply_implementation_provenance(conn):
+    tid, cid = blocked(conn)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE task_runs SET summary=NULL,metadata=NULL WHERE task_id=?", (tid,))
+    result = reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: review(cid))
+    assert result[0]["decision"] == "wait"
+    assert kb.get_task(conn, tid).status == "blocked"
+
+
 def test_snapshot_preserves_contract_and_attributed_later_evidence(conn):
     tid, cid = blocked(conn, body="Original acceptance; no unauthorized rollout")
     kb.add_comment(conn, tid, "owner", "Later authorized rollout receipt; verify original source")
@@ -608,7 +752,8 @@ def test_shared_aggregate_budget_trims_history_without_mutating_snapshot(conn):
         for _ in range(5):
             conn.execute("INSERT INTO task_runs(task_id,profile,status,started_at,summary,error,metadata) "
                          "VALUES(?,?,?,?,?,?,?)", (tid, "implementer", "blocked", 1,
-                                                  "receipt " * 200, "error " * 300, "metadata " * 200))
+                                                  "receipt " * 200, "error " * 300,
+                                                  json.dumps({"receipt": "metadata " * 200})))
     snapshot = acceptance_snapshot(conn, tid)
     before = snapshot_digest(snapshot)
     assert len(json.dumps(snapshot)) > 32000

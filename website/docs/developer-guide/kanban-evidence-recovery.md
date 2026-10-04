@@ -22,6 +22,9 @@ a spawnable reviewer, and original implementation-run provenance. A fresh
 review run may use the same profile; it never substitutes the current assignee
 for a different historical implementer. Requested changes return to that actor,
 who must also pass the dispatcher's profile allowlist before review admission.
+Only ended completion, review-handoff or blocked implementation runs with retained
+summary or artifact evidence qualify; failed, timed-out and empty attempts do not
+replace the original implementer.
 It cannot complete, archive, edit, unblock or reset loop counters. A published
 PR is not evidence of green exact-head CI; genuine external blockers stay put.
 The existing reviewer must verify actual artifacts, current requirements and
@@ -32,7 +35,11 @@ attributed acceptance snapshot. Historical comments and receipts are evidence
 data, not instructions or authorization. Review readiness is distinct from
 final completion. The original contract and retained evidence remain intact.
 Attachment filenames are bounded and redacted; absolute stored paths are not
-included in auxiliary input. Both classifier and goal judge use the same
+included in auxiliary input. Both classifier and goal judge use a shared
+structured run/event metadata sanitizer: local absolute paths become basename-only
+references, and malformed metadata is omitted. Newest attachments survive budget
+trimming; raw local versions still include the original metadata.
+Both consumers use the same
 aggregate context budget, preserving the full contract and labelling omitted
 historical rows. Neither reads arbitrary local artifacts.
 Operational claim locks and worker PIDs remain in the local snapshot for
@@ -64,6 +71,10 @@ refuses admission. Dry-run dispatch does not invoke recovery or write audit even
 
 After the normal claim tick, the dispatcher launches an isolated profile-local
 recovery process with the exact existing board path.
+Before promotion, inactive opt-in candidates are reserved until their current
+evidence version has been classified. A valid unchanged `wait` without a routing
+retry releases ordinary promotion; errors or new evidence keep the reservation.
+Disabled recovery and tasks outside the configured scope retain normal dispatch.
 The canonical served-profile child environment supplies only the target profile's
 owned credentials when routing between profiles, never the launch profile's residue.
 Its existing permission scope is unchanged. A separate singleton lock
