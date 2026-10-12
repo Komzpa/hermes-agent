@@ -153,3 +153,137 @@ def test_default_home_claimed_run_registers_and_releases(tmp_path):
     assert sched._running_job_ids == set()
     assert sched._running_fire_owners == {}
     assert sched.get_running_job_ids() == frozenset()
+
+
+# --- fire-boundary persistence of gateway_state.active_agents (updater busy gate) ---
+
+import json  # noqa: E402
+import logging  # noqa: E402
+
+
+def _runner():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._restart_requested = False
+    runner.adapters = {}
+    return runner
+
+
+def _persisted(tmp_path):
+    from gateway.status import flush_runtime_status
+
+    flush_runtime_status()
+    path = tmp_path / "gateway_state.json"
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+@pytest.fixture
+def _clear_listener():
+    yield
+    sched.set_running_change_listener(None)
+
+
+@pytest.mark.parametrize("home_name", ["launch", "secretary"])
+def test_fire_start_and_end_persist_active_work_count(tmp_path, monkeypatch, _clear_listener, home_name):
+    """(5) During a fire the persisted gateway_state active_agents is >= 1; after
+    the fire ends it is 0. Default-home and secondary-profile fires both.
+
+    RED without the production hook: nothing re-stamps active_agents at fire
+    boundaries, so the file is absent (or stale) mid-run.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sched.set_running_change_listener(_runner()._persist_active_agents)
+    home = tmp_path / home_name
+    home.mkdir()
+    job_id = f"counted-fire-{home_name}"
+    seen = {}
+
+    def _fake_run(job, **kwargs):
+        seen["during"] = (_persisted(tmp_path) or {}).get("active_agents")
+        return True
+
+    with _Scope(home), patch("cron.scheduler.run_one_job", side_effect=_fake_run):
+        tools._run_claimed_job({"id": job_id, "name": job_id})
+    assert seen["during"] is not None and seen["during"] >= 1
+    assert (_persisted(tmp_path) or {}).get("active_agents") == 0
+
+
+def test_fire_owner_lifecycle_persists_count_and_endures_run_failure(tmp_path, monkeypatch, _clear_listener):
+    """(6) run_one_job's fire-owner start and its finally-release each persist the
+    count — on the normal path and when the run body raises."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sched.set_running_change_listener(_runner()._persist_active_agents)
+    home = tmp_path / "profile"
+    home.mkdir()
+    job = {"id": "fire-owner-job", "name": "fire-owner-job", "fire_claim": {"by": "owner-1"}}
+    seen = {}
+
+    def _hb(job, run):
+        seen["during"] = (_persisted(tmp_path) or {}).get("active_agents")
+        return True
+
+    def _hb_raises(job, run):
+        seen["during_raise"] = (_persisted(tmp_path) or {}).get("active_agents")
+        raise RuntimeError("job crashed")
+
+    patches = (
+        patch("cron.scheduler.create_execution", return_value={"id": "exec-1"}),
+        patch("cron.scheduler.note_cron_execution"),
+        patch("cron.scheduler.finish_execution"),
+        patch("cron.scheduler._launch_external_cron_worker", return_value=False),
+    )
+    with _Scope(home):
+        for p in patches:
+            p.start()
+        try:
+            with patch("cron.scheduler._run_with_fire_claim_heartbeat", side_effect=_hb):
+                assert sched.run_one_job(job) is True
+            assert seen["during"] is not None and seen["during"] >= 1
+            assert (_persisted(tmp_path) or {}).get("active_agents") == 0
+            with patch("cron.scheduler._run_with_fire_claim_heartbeat", side_effect=_hb_raises):
+                with pytest.raises(RuntimeError):
+                    sched.run_one_job(job)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+    assert seen["during_raise"] is not None and seen["during_raise"] >= 1
+    assert (_persisted(tmp_path) or {}).get("active_agents") == 0
+    assert sched.get_running_job_ids() == frozenset()
+
+
+def test_sweep_forced_release_persists_count(tmp_path, monkeypatch, _clear_listener):
+    """(7) The sweep's forced release of an orphaned fire-owner also re-stamps the count."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sched.set_running_change_listener(_runner()._persist_active_agents)
+    home = tmp_path / "profile"
+    home.mkdir()
+    job_id = "orphaned-fire"
+    key = sched._inflight_key(job_id, home)
+    sched._running_fire_owners[key] = {object(): ("owner-1", home.resolve())}
+    row = {"status": "completed", "id": "exec-1", "claimed_at": _now_iso()}
+    with _Scope(home), \
+            patch("cron.executions.latest_executions", return_value={job_id: row}), \
+            patch.object(sched, "mark_job_run"):
+        released = sched.sweep_stale_inflight([])
+    assert released == [job_id]
+    assert (_persisted(tmp_path) or {}).get("active_agents") == 0
+
+
+def test_listener_failure_never_breaks_the_cron_run(tmp_path, monkeypatch, _clear_listener, caplog):
+    """(8) A writer failure in the hook is logged and swallowed: the run completes."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def _boom():
+        raise RuntimeError("gateway writer down")
+
+    sched.set_running_change_listener(_boom)
+    home = tmp_path / "launch"
+    home.mkdir()
+    job_id = "listener-failure-job"
+    with caplog.at_level(logging.DEBUG), \
+            _Scope(home), patch("cron.scheduler.run_one_job", return_value=True):
+        result = tools._run_claimed_job({"id": job_id, "name": job_id})
+    assert result["claimed"] is True and result["error"] is None
+    assert sched.get_running_job_ids() == frozenset()
+    assert "non-fatal" in caplog.text
