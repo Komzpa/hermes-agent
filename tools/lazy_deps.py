@@ -6,6 +6,8 @@ from hermes_cli._old_updater import in_historical_update, stop_for_relaunch
 
 
 def ensure(feature: str, *, prompt: bool = True) -> NoReturn:
+    # Hindsight dependency range is owned by the project extra and plugin manifest.
+    # This obsolete shim must not install a competing, stale pin.
     # Shim to suppress old updater work until relaunch. Do not claim readiness.
     # Preserve the dependency-unavailable failure without claiming a completed install.
     raise ImportError("Dependencies are unknown to this old updater. Please relaunch Hermes.")

@@ -120,6 +120,7 @@ def test_lazy_installable_extras_excluded_from_all():
         "wake", "wake-openwakeword", "wake-sherpa", "wake-porcupine",
         "google-chat",
         "mistral",  # mistralai — Voxtral STT/TTS, lazy-installed (stt.mistral / tts.mistral)
+        "hindsight",  # client is installed only when the Hindsight memory backend is selected
     }
     all_extra_specs = optional_dependencies["all"]
     for extra in lazy_covered_extras:

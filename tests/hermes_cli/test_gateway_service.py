@@ -63,6 +63,15 @@ class TestUserSystemdPrivateSocketPreflight:
 
 class TestSystemdServiceRefresh:
 
+    def test_managed_systemd_unit_skips_refresh(self, tmp_path, monkeypatch):
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text("managed unit\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_REEMXY_MANAGED_SYSTEMD_UNIT", "1")
+        monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
+
+        assert gateway_cli.refresh_systemd_unit_if_needed() is False
+        assert unit_path.read_text(encoding="utf-8") == "managed unit\n"
+
     def test_systemd_restart_timeout_prints_status_guidance(self, monkeypatch, capsys):
         """`hermes gateway restart` must not surface a raw TimeoutExpired traceback.
 

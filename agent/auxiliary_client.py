@@ -1590,6 +1590,15 @@ class _CodexCompletionsAdapter:
                 guard.release_stream(event_stream)
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
+            # Preserve the legacy empty turn only for compatible hosts that return
+            # a completed object directly instead of an event stream.
+            if (
+                hasattr(event_stream, "output")
+                and str(getattr(final, "status", "") or "").strip().lower() == "completed"
+                and getattr(final, "output", None) is None
+                and not str(getattr(final, "output_text", "") or "").strip()
+            ):
+                final.output = [SimpleNamespace(type="message", role="assistant", status="completed", content=[])]
             from agent.auxiliary_codex_response import _parse_codex_final_response
 
             text_parts, tool_calls_raw, usage, finish_reason = _parse_codex_final_response(
@@ -4306,6 +4315,25 @@ def _try_main_agent_model_fallback(
     so a hung aux model says nothing about the main model's health. Returns (client, model, label) or (None, None, "")."""
     main_provider = (_read_main_provider() or "").strip()
     main_model = (_read_main_model() or "").strip()
+    if main_provider.lower() == "custom":
+        try:
+            from hermes_cli.runtime_provider import (
+                _get_named_custom_provider,
+                canonical_custom_identity,
+            )
+
+            named_provider = canonical_custom_identity(
+                base_url=_read_main_base_url(), model=main_model
+            )
+            named_entry = (
+                _get_named_custom_provider(named_provider)
+                if named_provider
+                else None
+            )
+            if named_entry and named_entry.get("api_mode") == "codex_responses":
+                main_provider = named_provider
+        except Exception:
+            pass
     if main_provider.lower() == "moa":
         # MoA virtual provider: fall back to the preset's aggregator (the acting model).
         _agg_provider, _agg_model = _resolve_moa_aggregator(main_model)

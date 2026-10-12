@@ -80,8 +80,8 @@ def test_no_agent_forwards_cancel_event_to_script_runner(monkeypatch):
     cancel = threading.Event()
     observed = []
 
-    def _script_runner(job, script_path, workdir=None, cancel_event=None):
-        observed.append(cancel_event)
+    def _script_runner(job, script_path, workdir=None, cancel_event=None, execution_id=None):
+        observed.append((cancel_event, execution_id))
         return True, ""
 
     monkeypatch.setattr(
@@ -98,11 +98,12 @@ def test_no_agent_forwards_cancel_event_to_script_runner(monkeypatch):
             "no_agent": True,
         },
         cancel_event=cancel,
+        execution_id="cancel-test-execution",
     )
 
     assert success is True
     assert error is None
-    assert observed == [cancel]
+    assert observed == [(cancel, "cancel-test-execution")]
 
 
 @pytest.mark.parametrize(

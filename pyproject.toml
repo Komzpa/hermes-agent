@@ -364,6 +364,7 @@ google-chat = [
 # can re-sync exactly the pin from core.
 doc-extract = ["firecrawl-anydoc==0.2.4"]
 trace-upload = ["huggingface-hub==1.24.0"]
+hindsight = ["hindsight-client==0.10.1"]
 # Cloud memory providers are opt-in PM extras. They stay outside [all]
 # so a quarantined release cannot break fresh installs.
 # Image resize recovery for the vision tools. Pillow is now a CORE dependency
@@ -714,6 +715,7 @@ google-auth-httplib2 = false
 google-auth-oauthlib = false
 google-cloud-pubsub = false
 h2 = false
+hindsight-client = false
 httplib2 = false
 httpx = false
 httpx2 = false
