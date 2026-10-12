@@ -2622,7 +2622,8 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         # Project context files only with a configured workdir; SOUL.md always.
         skip_context_files=not bool(workdir),
         load_soul_identity=True,
-        skip_memory=False,
+        # Upstream stays memory-free by default. Private profiles may opt in to their configured provider.
+        skip_memory=not bool((_cfg.get("cron") or {}).get("load_memory", False)),
         skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
         platform="cron",
         session_id=session_id,
