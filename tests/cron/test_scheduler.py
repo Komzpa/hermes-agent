@@ -648,6 +648,7 @@ class TestRunJobSessionPersistence:
             "name": "test",
             "prompt": "hello",
         }
+        (tmp_path / "config.yaml").write_text("cron:\n  load_memory: true\n")
         with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
             run_job(job)
 
@@ -656,6 +657,18 @@ class TestRunJobSessionPersistence:
         assert "memory" not in (kwargs["disabled_toolsets"] or []), (
             "memory toolset must not be policy-denied in cron"
         )
+
+    def test_run_job_memory_skipped_by_default_in_cron(self, tmp_path):
+        """Without cron.load_memory, cron agents stay memory-free (profile opt-in)."""
+        job = {
+            "id": "memory-default-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        assert mock_agent_cls.call_args.kwargs["skip_memory"] is True
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
