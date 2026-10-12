@@ -2093,6 +2093,10 @@ def _deliver_result(
             guarded=settings is not None)
 
     settings = (user_cfg or {}).get("cron", {}).get("delivery_acceptance", {}).get(job["id"])
+    if isinstance(settings, dict) and _sched._is_final_draft_only_opt_in(settings, job):
+        # Final-draft-only opt-in carries no action module: the verdict already ran at
+        # compose time, so there is no action gate to enforce here.
+        settings = None
     if job.get("require_action_acceptance") and settings is None:
         job["_action_acceptance_failure"] = "MissingConfiguration"
         return "action_acceptance_refused:MissingConfiguration"
