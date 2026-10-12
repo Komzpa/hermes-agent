@@ -716,17 +716,26 @@ class _CombinedCancelEvent:
 # calls back into ``get_running_job_ids``), so each mutation site notifies after
 # releasing the lock.
 _running_change_listener = None
+_running_change_listener_configured = False
 
 
 def set_running_change_listener(listener) -> None:
-    """Register ``listener()`` to run after every running-set transition (None clears)."""
-    global _running_change_listener
+    """Override the gateway writer in tests or embedders (None disables it)."""
+    global _running_change_listener, _running_change_listener_configured
     _running_change_listener = listener
+    _running_change_listener_configured = True
 
 
 def _notify_running_change() -> None:
-    """Best-effort change notice; a failing listener must never break a cron run."""
+    """Persist running-set transitions through the gateway's existing writer."""
     listener = _running_change_listener
+    if not _running_change_listener_configured:
+        try:
+            from gateway.run import _gateway_runner_ref
+            runner = _gateway_runner_ref()
+            listener = getattr(runner, "_persist_active_agents", None)
+        except Exception:
+            listener = None
     if listener is None:
         return
     try:
