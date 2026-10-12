@@ -2666,6 +2666,68 @@ def _load_action_acceptance_gate(settings):
                 sys.path.append(str(path))
     return importlib.import_module(settings["module"])
 
+# --- Final-draft delivery acceptance (secretary) ---
+#
+# Opt-in per job through ``cron.delivery_acceptance.<job_id>`` with
+# ``{"final_draft": true}``. The verdict runs on the success branch of
+# ``_compose_run_delivery`` and judges the final draft against the turn's
+# actual tool evidence (which searches ran, whether a fetch/extract returned
+# a body) — never against the draft's own claims. ``deliver`` sends verbatim;
+# ``continue-internally``/``drop`` suppress the send and surface as
+# ``final_draft_held:<verdict>:<reason>`` so ``_classify_delivery_outcome``
+# maps them like ``blocked_acceptance``.
+
+FINAL_DRAFT_HOLD_PREFIX = "final_draft_held:"
+
+
+def _final_draft_opted_in(job):
+    """True when the job carries final-draft acceptance settings (stashed by ``run_job``)."""
+    settings = job.get("_final_draft_acceptance")
+    return bool(isinstance(settings, dict) and settings.get("final_draft"))
+
+
+def _is_final_draft_only_opt_in(settings, job):
+    """True for a ``delivery_acceptance`` entry that only opts into the final-draft
+    verdict (no action-acceptance ``module``). The action gate in ``_deliver_result``
+    must not treat it as a misconfigured action module."""
+    return (
+        isinstance(settings, dict)
+        and bool(settings.get("final_draft"))
+        and not settings.get("module")
+        and not job.get("require_action_acceptance")
+    )
+
+
+def _evaluate_final_draft_verdict(*, evidence, comparison_inputs_present=None,
+                                  material_correction=False, draft=""):
+    """Verdict over one final draft from structured turn evidence.
+
+    ``evidence``: the turn's actual tool records (``{"tool", "status", "detail"}``).
+    No wording/regex inspection of ``draft`` happens here: an empty draft drops,
+    a material correction delivers, and otherwise only fetch/extract outcomes decide.
+    Returns ``(verdict, reason)`` with verdict in
+    ``{"deliver", "continue-internally", "drop"}``.
+    """
+    if not str(draft or "").strip():
+        return "drop", "empty draft: nothing to deliver"
+    if material_correction:
+        return "deliver", "material correction delivers even with an evidence gap"
+    fetch_attempts = [
+        record for record in (evidence or [])
+        if "fetch" in str((record or {}).get("tool") or "").lower()
+        or "extract" in str((record or {}).get("tool") or "").lower()
+    ]
+    if not fetch_attempts:
+        return "deliver", "no fetch/extract attempted: no evidence gap to judge"
+    if any(str((record or {}).get("status") or "").lower() == "ok"
+            for record in fetch_attempts):
+        return "deliver", "fetch/extract returned a body"
+    if comparison_inputs_present is True:
+        return "deliver", "comparison inputs grounded outside the failed fetch"
+    detail = "; ".join(
+        str((record or {}).get("detail") or (record or {}).get("status") or "")
+        for record in fetch_attempts).strip() or "extraction failed"
+    return "continue-internally", f"partial fragment without evidence: {detail}"
 
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
@@ -2731,6 +2793,10 @@ def run_job(
             agent._action_acceptance_capture = gate.prepare_native(
                 acceptance, job={**job, "execution_id": execution_id or job.get("execution_id")},
                 implementation_path=scheduler_delivery.__file__, preparation_text=prompt)
+        if isinstance(acceptance, dict) and acceptance.get("final_draft"):
+            # Final-draft verdict opt-in (cron.delivery_acceptance.<job_id> = {"final_draft": true}):
+            # stashed on the job for _compose_run_delivery; no action-receipt capture involved.
+            job["_final_draft_acceptance"] = {"final_draft": True}
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(
@@ -3063,6 +3129,8 @@ def _classify_delivery_outcome(
 ) -> str:
     if str(delivery_error or "").startswith("action_acceptance_refused:"):
         return "blocked_acceptance"
+    if str(delivery_error or "").startswith(FINAL_DRAFT_HOLD_PREFIX):
+        return "blocked_acceptance"
     if delivery_error:
         return "failed"
     if should_deliver and delivery_queued:
@@ -3102,6 +3170,25 @@ def _compose_run_delivery(
     elif success:
         deliver_content = final_response
         _resolve_incidents_for_recovered_job(job)
+        if _final_draft_opted_in(job):
+            _fd_verdict, _fd_reason = _evaluate_final_draft_verdict(
+                evidence=job.get("_final_draft_evidence"),
+                comparison_inputs_present=job.get("_comparison_inputs_present"),
+                material_correction=bool(job.get("_final_draft_correction")),
+                draft=final_response)
+            if _fd_verdict != "deliver":
+                # Suppress the send: record the fragment plus the evidence gap on the job
+                # (the saved output already holds the verbatim draft) so the next waking
+                # turn continues the research; no chat message at all.
+                job["_final_draft_verdict"] = _fd_verdict
+                job["_final_draft_gap"] = _fd_reason
+                job["_final_draft_fragment"] = final_response
+                job["final_draft_hold"] = (
+                    f"{FINAL_DRAFT_HOLD_PREFIX}{_fd_verdict}:{_fd_reason}")
+                logger.info(
+                    "Job '%s': final-draft verdict %s — %s",
+                    job["id"], _fd_verdict, _fd_reason)
+                deliver_content = ""
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
@@ -3238,6 +3325,14 @@ def _save_compose_deliver(
     ) = _compose_run_delivery(
         job, success=d.success, error=d.error, final_response=final_response,
         output_file=output_file, agent_declared=d.agent_declared)
+    final_draft_hold = job.pop("final_draft_hold", None)
+    if final_draft_hold and not deliver_content.strip():
+        # Final-draft verdict (see _compose_run_delivery): no send; the hold reason rides as
+        # the delivery error so _classify_delivery_outcome maps it like blocked_acceptance.
+        d.delivery_error = final_draft_hold
+        d.should_deliver = False
+        logger.info("Job '%s': %s", job["id"], final_draft_hold)
+        return
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
     if not d.success and not _cron_failure_delivery_enabled():
