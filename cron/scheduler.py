@@ -706,6 +706,35 @@ class _CombinedCancelEvent:
             event.set()
 
 
+# Change-notification hook: the gateway registers its persist callback at startup
+# (``gateway.run._start_gateway_start_cron_and_housekeeping``), so every running-set
+# transition — fire start, fire end, forced release — re-stamps
+# ``gateway_state.json`` ``active_agents`` through the gateway's single writer
+# (``GatewayRunner._persist_active_agents`` → ``_active_work_count``). Without it a
+# running cron fire is invisible to the updater's busy gate and a stale count can
+# block updates for hours. The listener is invoked OUTSIDE ``_running_lock`` (it
+# calls back into ``get_running_job_ids``), so each mutation site notifies after
+# releasing the lock.
+_running_change_listener = None
+
+
+def set_running_change_listener(listener) -> None:
+    """Register ``listener()`` to run after every running-set transition (None clears)."""
+    global _running_change_listener
+    _running_change_listener = listener
+
+
+def _notify_running_change() -> None:
+    """Best-effort change notice; a failing listener must never break a cron run."""
+    listener = _running_change_listener
+    if listener is None:
+        return
+    try:
+        listener()
+    except Exception:
+        logger.debug("Running-change listener failed (non-fatal)", exc_info=True)
+
+
 def get_running_job_ids() -> frozenset[str]:
     """Thread-safe snapshot of executing job IDs (dispatch until ``_process_job`` returns). Read by
     the gateway shutdown drain, otherwise blind to cron work (runs outside ``_running_agents``).
@@ -866,7 +895,8 @@ def try_register_running_job(job_id: str, *, owner=None, future=_FUTURE_PENDING)
         _running_since[key] = time.time()
         _running_futures[key] = future
         _running_registration_owners[key] = owner
-        return True
+    _notify_running_change()
+    return True
 
 
 def release_running_job(
@@ -890,6 +920,7 @@ def release_running_job(
         _running_futures.pop(key, None)
         _running_worker_pids.pop(key, None)
         _scope_isolated_job_ids.discard(key)
+    _notify_running_change()
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -1174,6 +1205,8 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
             _forced_release_count += 1
             stale.append((job_id, age, allowance, None, "ledger-terminal"))
             reported.add(job_id)
+    if stale:
+        _notify_running_change()
 
     for job_id, age, allowance, fut, _reason in stale:
         _record_stale_release(by_id.get(job_id) or {}, job_id, age, allowance, fut, _reason)
@@ -2965,6 +2998,7 @@ def run_one_job(
     with _running_lock:
         _running_fire_owners.setdefault(_fire_key, {})[execution_token] = (
             fire_owner or None, profile_home)
+    _notify_running_change()
     try:
         with self_removal_delivery_scope(job["id"]):
             return _run_with_fire_claim_heartbeat(
@@ -2985,6 +3019,7 @@ def run_one_job(
                 executions.pop(execution_token, None)
                 if not executions:
                     _running_fire_owners.pop(_fire_key, None)
+        _notify_running_change()
 
 
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
