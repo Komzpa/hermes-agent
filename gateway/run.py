@@ -5669,11 +5669,6 @@ def _start_gateway_start_cron_and_housekeeping(runner):
             runner._draining or runner._external_drain_active)
     # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
     from cron.scheduler_thread import SupervisedTickerThread
-    # Persist gateway_state.active_agents at every cron fire start/end (and forced release) through
-    # the runner's existing single writer, so the updater's busy gate sees in-flight cron work the
-    # moment it exists instead of waiting for a chat turn that may never come.
-    from cron import scheduler as _cron_scheduler
-    _cron_scheduler.set_running_change_listener(runner._persist_active_agents)
     cron_thread = SupervisedTickerThread(
         cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, stop_event=cron_stop)
     cron_thread.start()
