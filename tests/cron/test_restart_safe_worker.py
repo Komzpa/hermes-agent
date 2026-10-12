@@ -1160,8 +1160,18 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
     from gateway.status import _pid_exists
     from tools import process_registry
 
+    # Seed the user systemd session env when the test process inherited none (a bare test
+    # runner may lack XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS even though the session lives).
+    import os
+    uid = os.getuid()
+    # Force-set the canonical user-session paths: a stale XDG_RUNTIME_DIR (e.g. a leftover
+    # /tmp value) must not keep the probe off the real user bus.
+    if os.path.isdir(f"/run/user/{uid}"):
+        os.environ["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
     if not process_registry._systemd_run_user_scope_available():
-        pytest.skip("systemd-run --user --scope is unavailable on this host")
+        # A silent skip would drop this guard from every run; fail loudly instead.
+        pytest.fail("systemd-run --user --scope is unavailable after seeding user systemd env")
 
     home = tmp_path / "profile"
     scripts_dir = home / "scripts"
