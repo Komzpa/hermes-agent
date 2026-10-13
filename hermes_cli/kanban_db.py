@@ -2148,7 +2148,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None, *,
-                    exclude_task_ids=()) -> int:
+                    exclude_task_ids=None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
 
@@ -2163,6 +2163,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None, 
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
+    if exclude_task_ids is None:
+        # Every caller (dispatcher, CLI/tool listing, link helpers) honours recovery
+        # reservations; only an explicit iterable overrides the central lookup.
+        from hermes_cli.kanban_recovery_review import pending_recovery_tasks
+        exclude_task_ids = pending_recovery_tasks(conn)
     excluded = set(exclude_task_ids)
     with write_txn(conn):
         todo_rows = conn.execute(

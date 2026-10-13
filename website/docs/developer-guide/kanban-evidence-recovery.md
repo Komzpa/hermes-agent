@@ -12,7 +12,7 @@ kanban:
 
 The scope includes the listed tasks and their incoming prerequisites, never
 their outgoing dependents. Native edges point from prerequisite to dependent.
-Only inactive blocked, todo or triage tasks with satisfied prerequisites and
+Only inactive blocked or todo tasks (triage is excluded: auto-decompose runs before any reservation) with satisfied prerequisites and
 no live claim, run or worker can be considered. Existing dispatcher concurrency,
 profile, respawn, review and completion gates continue to apply.
 

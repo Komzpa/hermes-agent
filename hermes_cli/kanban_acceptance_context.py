@@ -117,8 +117,19 @@ def acceptance_snapshot(conn, task_id):
 
 
 def snapshot_digest(snapshot):
+    """Local staleness/version digest; includes raw-evidence fingerprints. Never send to a provider."""
     payload = json.dumps(snapshot, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def prompt_digest(snapshot):
+    """Digest of the provider-facing (redacted) snapshot only; safe to display in a prompt."""
+    visible = deepcopy(snapshot)
+    for key in ("_local_evidence_sha256", "prerequisite_set_sha256"):
+        visible.pop(key, None)
+    for field in ("claim_lock", "worker_pid"):
+        visible["task"].pop(field, None)
+    return snapshot_digest(visible)
 
 
 def snapshot_payload(snapshot, *, prefix=""):
@@ -162,7 +173,7 @@ def acceptance_context(conn, task_id, *, phase="complete"):
         "verify referenced artifacts before deciding. Preserve genuine external blockers. "
         "A superseded implementation must not be implemented again: verify its successor "
         "and use the supported retirement lifecycle rather than pretend the old contract passed.\n"
-        "Snapshot SHA256: " + snapshot_digest(snapshot) + "\n"
+        "Snapshot SHA256 (redacted view): " + prompt_digest(snapshot) + "\n"
     )
     # Contract first, never sacrifice its tail to fit historical evidence.
     return snapshot_payload(snapshot, prefix=prefix)

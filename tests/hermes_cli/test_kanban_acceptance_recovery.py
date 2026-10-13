@@ -22,11 +22,14 @@ def conn(tmp_path, monkeypatch):
     connection.close()
 
 
-def blocked(conn, title="Retained implementation", body="Independent review required"):
+def blocked(conn, title="Retained implementation", body="Independent review required",
+            reviewer="reviewer"):
     tid = kb.create_task(conn, title=title, body=body, assignee="implementer", goal_mode=True)
     assert kb.claim_task(conn, tid) is not None
     assert kb.block_task(conn, tid, reason="Independent review required")
     cid = kb.add_comment(conn, tid, "worker", "Implementation and test receipt retained")
+    if reviewer:  # independent reviewer profile, distinct from the implementing run's
+        assert kb.assign_task(conn, tid, reviewer)
     return tid, cid
 
 
@@ -961,3 +964,60 @@ def test_real_worker_entrypoint_with_disabled_profile_never_calls_model(conn, tm
     assert kb.get_task(conn, tid).status == "blocked"
     assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? "
                         "AND kind='recovery_review_checked'", (tid,)).fetchone()[0] == 0
+
+
+def test_prompt_digest_does_not_fingerprint_raw_secrets(conn):
+    """Two raw secrets that redact identically: same displayed digest, different local version."""
+    from hermes_cli.kanban_acceptance_context import prompt_digest, snapshot_digest
+    tid, _ = blocked(conn, body="deploy with API_KEY=alpha1234567890abcdef")
+    first = acceptance_snapshot(conn, tid)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET body=? WHERE id=?",
+                     ("deploy with API_KEY=bravo9876543210fedcba", tid))
+    second = acceptance_snapshot(conn, tid)
+    assert snapshot_digest(first) != snapshot_digest(second)
+    assert prompt_digest(first) == prompt_digest(second)
+    text = acceptance_context(conn, tid)
+    assert snapshot_digest(second) not in text
+    assert second["_local_evidence_sha256"] not in text
+
+
+def test_triage_is_not_recoverable(conn):
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, cid = blocked(conn)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+    assert reconcile_recovery_reviews(conn, config=config(tid),
+                                      judge=lambda _: pytest.fail("triage classified")) == []
+    assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_unrenderable_contract_is_not_reserved_from_normal_dispatch(conn, monkeypatch):
+    import hermes_cli.config
+    import hermes_cli.kanban_recovery_review as recovery
+    tid, _ = blocked(conn, body="Required criterion. " * 2000)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda *a, **k: {
+        "kanban": {"recovery_review": config(tid)}})
+    assert recovery.pending_recovery_tasks(conn) == set()
+
+
+def test_every_recompute_ready_caller_honours_recovery_reservation(conn, monkeypatch):
+    import hermes_cli.config
+    tid, _ = blocked(conn)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+    monkeypatch.setattr(hermes_cli.config, "load_config", lambda *a, **k: {
+        "kanban": {"recovery_review": config(tid)}})
+    assert kb.recompute_ready(conn) == 0  # no explicit exclusion argument
+    assert kb.get_task(conn, tid).status == "todo"
+
+
+def test_reviewer_must_differ_from_implementer(conn, monkeypatch):
+    import hermes_cli.config_effective
+    monkeypatch.setattr(hermes_cli.config_effective, "load_user_config_effective", lambda **kw: {
+        "kanban": {"dispatch_profiles": ["implementer"]}})
+    tid, cid = blocked(conn, reviewer=None)  # assignee is still the implementing profile
+    reconcile_recovery_reviews(conn, config=config(tid), judge=lambda _: review(cid))
+    assert kb.get_task(conn, tid).status == "blocked"

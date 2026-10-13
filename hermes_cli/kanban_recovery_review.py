@@ -109,6 +109,10 @@ def _review_provenance(conn, task):
         if not str(row[3] or "").strip() and not has_artifacts:
             continue
         implementer = kb._canonical_assignee(row[1])
+        if implementer == reviewer:
+            # Independent review: a task whose only implementer is the reviewer would
+            # route requested changes straight back to its own reviewer.
+            return None
         if implementer and kb._retry_status_for_run(conn, task.id, row[0]) != "review":
             if not exists(implementer):
                 return None
@@ -134,6 +138,12 @@ def pending_recovery_tasks(conn):
             continue
         snapshot = acceptance_snapshot(conn, task_id)
         if not snapshot["prerequisites_satisfied"]:
+            continue
+        try:
+            snapshot_payload(snapshot)
+        except ValueError:
+            # Unrenderable contracts can never be classified; do not hold them back
+            # from normal implementation dispatch (reconcile also refuses them).
             continue
         previous = conn.execute("SELECT payload FROM task_events WHERE task_id=? "
                                 "AND kind='recovery_review_checked' ORDER BY id DESC LIMIT 1",
@@ -173,7 +183,9 @@ def reconcile_recovery_reviews(conn, *, config=None, judge=None):
         if attempts >= budget:
             break
         task = kb.get_task(conn, task_id)
-        if not task or task.status not in ("blocked", "todo", "triage"):
+        # Triage is intentionally not recoverable: the gateway's auto-decompose sweep
+        # runs before any recovery reservation could protect it.
+        if not task or task.status not in ("blocked", "todo"):
             continue
         if task.claim_lock or task.current_run_id is not None or task.worker_pid:
             continue
