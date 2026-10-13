@@ -347,6 +347,16 @@ def recover_durable_inbound_events() -> list[Any]:
                 # died before it unlinked the inbound file.
                 acknowledge_durable_inbound_event(event)
                 continue
+            if payload.get("output_started"):
+                # Visible output may already exist but no ledger row owns it:
+                # replaying could execute the turn (and its tools) twice.  Move
+                # the record out of the replay glob and keep it as evidence.
+                quarantined = path.with_name("indeterminate-" + path.name)
+                path.replace(quarantined)
+                logger.warning(
+                    "Durable inbound %s had started output without an outbound owner; "
+                    "not replaying (kept as %s)", payload.get("obligation_id"), quarantined.name)
+                continue
             try:
                 arrival_sequence = int(payload.get("arrival_sequence"))
             except (TypeError, ValueError):
@@ -357,6 +367,47 @@ def recover_durable_inbound_events() -> list[Any]:
         except Exception as exc:
             logger.warning("Cannot restore durable inbound event %s: %s", path, exc)
     return [event for _arrival_sequence, _name, event in sorted(events)]
+
+
+def _inbound_spool_ids(event: Any) -> list[str]:
+    event = getattr(event, "terminal_event", None) or event
+    members = getattr(event, "input_members", None)
+    if members:
+        return [str(m["inbound_id"]) for m in members if m.get("inbound_id")]
+    own = durable_inbound_obligation_id(event)
+    return [own] if own else []
+
+
+def mark_durable_inbound_output_started(event: Any) -> int:
+    """Settle the inbound spool as ``indeterminate`` before any visible stream effect.
+
+    Streaming can reach the platform before a delivery-ledger obligation (the
+    output owner) exists.  A crash in that gap must not make startup replay a
+    turn whose output is already real, so each spool record is stamped with
+    ``output_started`` first.  Recovery then quarantines (never replays) a
+    stamped record that has no outbound transfer.  A later obligation write
+    retires the record as usual.  Idempotent; returns the number of records
+    stamped now.
+    """
+    stamped = 0
+    ids = _inbound_spool_ids(event)
+    if not ids:
+        return 0
+    flush_dir = _get_flush_dir()
+    with _DURABLE_INBOUND_LOCK:
+        for obligation_id in ids:
+            paths = list(flush_dir.glob(f"inbound-*-{obligation_id}.json"))
+            legacy_path = flush_dir / f"inbound-{obligation_id}.json"
+            if legacy_path.exists():
+                paths.append(legacy_path)
+            for path in paths:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if payload.get("output_started"):
+                    continue
+                payload["output_started"] = int(time.time())
+                _write_payload(flush_dir, payload, file_name=path.name)
+                stamped += 1
+    return stamped
 
 
 def acknowledge_durable_inbound_event(event: Any) -> None:
