@@ -35,6 +35,11 @@ DEFAULT_JUDGE_TIMEOUT = 30.0
 # JSON verdict; 200 (the original) reliably truncated it and tripped the auto-pause. 4096 covers
 # every model live-tested; override via auxiliary.goal_judge.max_tokens.
 DEFAULT_JUDGE_MAX_TOKENS = 4096
+# Cap how much of the goal text we send to the judge.
+_JUDGE_GOAL_LIMIT_CHARS = 2000
+# Kanban cards carry acceptance criteria in title+body; kanban call sites
+# derive a bounded larger budget via kanban_goal_limit() instead of a global bump.
+_JUDGE_KANBAN_GOAL_LIMIT_CHARS = 8000
 # Cap how much of the last response we send to the judge.
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 # Consecutive judge *parse* failures (empty / non-JSON) before the loop auto-pauses and points at
@@ -713,6 +718,12 @@ def _truncate(text: str, limit: int) -> str:
         return ""
     return text if len(text) <= limit else text[:limit] + "… [truncated]"
 
+def kanban_goal_limit(goal_text: str) -> int:
+    """Bounded judge budget for a kanban title+body goal. Covers the card's own
+    acceptance criteria without a global bump; clamps to
+    ``_JUDGE_KANBAN_GOAL_LIMIT_CHARS`` so the prompt stays bounded."""
+    return min(max(len(goal_text or ""), _JUDGE_GOAL_LIMIT_CHARS), _JUDGE_KANBAN_GOAL_LIMIT_CHARS)
+
 
 def _pid_alive(pid: int) -> bool:
     """Liveness via ``gateway.status._pid_exists`` (psutil + ctypes/POSIX fallback). Never uses
@@ -900,6 +911,7 @@ def judge_goal(
     background_processes: Optional[list[dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    goal_limit: int = _JUDGE_GOAL_LIMIT_CHARS,
 ) -> tuple[str, str, bool, Optional[dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -913,6 +925,12 @@ def judge_goal(
         return "continue", "empty response (nothing to evaluate)", False, None, False
     if timeout is None:
         timeout = _goal_judge_timeout()   # the declared default is the config key, not the constant
+    try:
+        goal_limit = int(goal_limit)
+    except (TypeError, ValueError):
+        goal_limit = _JUDGE_GOAL_LIMIT_CHARS
+    if goal_limit < 1:
+        goal_limit = _JUDGE_GOAL_LIMIT_CHARS
 
     try:
         from agent.auxiliary_client import call_llm
@@ -925,7 +943,7 @@ def judge_goal(
     # block as extra criteria so the judge sees a single source of truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     common = dict(
-        goal=_truncate(goal, 2000),
+        goal=_truncate(goal, goal_limit),
         response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
         background_block=_render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),

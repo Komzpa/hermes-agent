@@ -848,7 +848,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
     if client is None or not model:
         return ("done", None)
 
-    from hermes_cli.goals import judge_goal
+    from hermes_cli.goals import judge_goal, kanban_goal_limit
 
     verdict, reason, transport_failed = "done", "", False
     try:
@@ -857,9 +857,9 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task.id}")
         try:
+            goal_text = f"{task.title}\n\n{task.body or ''}".strip()
             verdict, reason, _, _, transport_failed = judge_goal(
-                goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                last_response=evidence.strip())
+                goal=goal_text, last_response=evidence.strip(), goal_limit=kanban_goal_limit(goal_text))
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
