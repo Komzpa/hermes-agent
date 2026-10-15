@@ -336,5 +336,5 @@ def _run_task_turns(agent, frame, history, context):
         return result.get('final_response', '')
     run_kanban_goal_loop(task_id=context['task_id'], goal_text=context['goal_text'], run_turn=turn,
         task_status_fn=status, block_fn=block, max_turns=context['goal_max_turns'] or DEFAULT_MAX_TURNS,
-        first_response=result.get('final_response', ''))
+        first_response=result.get('final_response', ''), board=context.get('board'))
     return result

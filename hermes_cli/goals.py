@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_time import safe_strftime
@@ -35,8 +35,12 @@ DEFAULT_JUDGE_TIMEOUT = 30.0
 # JSON verdict; 200 (the original) reliably truncated it and tripped the auto-pause. 4096 covers
 # every model live-tested; override via auxiliary.goal_judge.max_tokens.
 DEFAULT_JUDGE_MAX_TOKENS = 4096
-# Cap how much of the last response we send to the judge.
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
+# Cap how much of the last response we send to the judge.
+# Cap how much of the goal text we send to the judge. Hook-supplied goal text
+# (transform_kanban_goal) may carry acceptance context and gets a larger budget.
+DEFAULT_GOAL_LIMIT = 2000
+HOOK_GOAL_TEXT_LIMIT = 32000
 # Consecutive judge *parse* failures (empty / non-JSON) before the loop auto-pauses and points at
 # the goal_judge config. API/transport errors do NOT count — those are tracked separately below.
 # Guards against small models that cannot follow the strict JSON contract burning the whole budget.
@@ -900,6 +904,7 @@ def judge_goal(
     background_processes: Optional[list[dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    goal_limit: int = DEFAULT_GOAL_LIMIT,
 ) -> tuple[str, str, bool, Optional[dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -913,6 +918,12 @@ def judge_goal(
         return "continue", "empty response (nothing to evaluate)", False, None, False
     if timeout is None:
         timeout = _goal_judge_timeout()   # the declared default is the config key, not the constant
+    try:
+        goal_limit = int(goal_limit)
+    except (TypeError, ValueError):
+        goal_limit = DEFAULT_GOAL_LIMIT
+    if goal_limit < 1:
+        goal_limit = DEFAULT_GOAL_LIMIT
 
     try:
         from agent.auxiliary_client import call_llm
@@ -925,7 +936,7 @@ def judge_goal(
     # block as extra criteria so the judge sees a single source of truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     common = dict(
-        goal=_truncate(goal, 2000),
+        goal=_truncate(goal, goal_limit),
         response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
         background_block=_render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
@@ -1585,6 +1596,87 @@ class GoalManager:
             "(no completion contract — set one with /goal draft <objective> or inline field: value lines)")
 
 
+# ── Kanban goal text transform ──────────────────────────────────────────
+
+KANBAN_GOAL_PHASES = frozenset({"turn", "complete", "review"})
+
+
+class GoalBlock(TypedDict):
+    """Block directive a ``transform_kanban_goal`` hook may return."""
+    action: str
+    reason: str
+
+
+class HookGoalText(str):
+    """Goal text supplied by a ``transform_kanban_goal`` hook (judged with ``HOOK_GOAL_TEXT_LIMIT``)."""
+
+
+def _kanban_task_default_goal(task: Any) -> tuple[Optional[str], str]:
+    """Derive ``(task_id, default_goal)`` from a kanban task object, mapping or id."""
+    if task is None:
+        return None, ""
+    if isinstance(task, str):
+        return task, ""
+    if isinstance(task, dict):
+        task_id = task.get("id")
+        title = task.get("title") or ""
+        body = task.get("body") or ""
+    else:
+        task_id = getattr(task, "id", None)
+        title = getattr(task, "title", None) or ""
+        body = getattr(task, "body", None) or ""
+    default = "\n\n".join(p for p in (str(title), str(body)) if p and p.strip()).strip()
+    return (str(task_id) if task_id is not None else None), default
+
+
+def kanban_goal_text(task: Any, *, board: Optional[str], phase: str,
+                     goal: Optional[str] = None) -> str | GoalBlock:
+    """Resolve the goal text a kanban judge gate evaluates against.
+
+    Fires the ``transform_kanban_goal`` hook (first non-None result wins) with
+    ``task_id``, ``board``, ``phase`` (``turn`` | ``complete`` | ``review``) and
+    ``goal`` (the default title+body). A ``str`` result replaces the goal (returned
+    as :class:`HookGoalText` so judges apply ``HOOK_GOAL_TEXT_LIMIT``); a
+    ``{"action": "block", "reason": ...}`` result blocks the task through the
+    caller's existing block path; ``None`` (or no registered hook, an unknown
+    phase, or a hook failure) falls back to the default. Never raises for
+    plugin behaviour.
+    """
+    task_id, default = _kanban_task_default_goal(task)
+    if goal is None:
+        goal = default
+    if board is None:
+        board = os.environ.get("HERMES_KANBAN_BOARD")
+    if phase not in KANBAN_GOAL_PHASES:
+        logger.debug("kanban_goal_text: unknown phase %r; using default goal", phase)
+        return goal
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+        if not has_hook("transform_kanban_goal"):
+            return goal
+    except Exception as exc:
+        logger.debug("kanban_goal_text gate failed open: %s", exc, exc_info=True)
+        return goal
+    try:
+        results = invoke_hook("transform_kanban_goal", task_id=task_id, board=board,
+                              phase=phase, goal=goal)
+    except Exception as exc:
+        logger.debug("kanban_goal_text hook failed open: %s", exc, exc_info=True)
+        return goal
+    for result in results or ():
+        if result is None:
+            continue
+        if isinstance(result, str):
+            return HookGoalText(result)
+        if isinstance(result, dict):
+            if result.get("action") == "block":
+                reason = result.get("reason") or ""
+                return {"action": "block", "reason": str(reason)}
+            logger.debug("kanban_goal_text: ignoring unknown action %r", result.get("action"))
+            continue
+        logger.debug("kanban_goal_text: ignoring result of type %s", type(result).__name__)
+    return goal
+
 # ── Kanban worker goal loop ───────────────────────────────────────────
 
 # Fed to a kanban goal-mode worker that hasn't completed/blocked its task yet: short, and points it
@@ -1633,6 +1725,7 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    board: Optional[str] = None,
 ) -> dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1683,10 +1776,18 @@ def run_kanban_goal_loop(
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return _result("stopped", f"status={status}")
 
+        turn_goal = kanban_goal_text(task_id, board=board, phase="turn", goal=goal_text)
+        if isinstance(turn_goal, dict):
+            hook_reason = turn_goal.get("reason") or "transform_kanban_goal hook blocked the task"
+            _log(f"kanban goal loop: task {task_id} blocked by transform_kanban_goal hook; blocking")
+            _block(f"transform_kanban_goal hook blocked task {task_id}: {hook_reason}")
+            return _result("blocked_by_hook", f"hook blocked: {hook_reason}")
+        turn_limit = HOOK_GOAL_TEXT_LIMIT if isinstance(turn_goal, HookGoalText) else DEFAULT_GOAL_LIMIT
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task_id}")
         try:
-            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(
+                str(turn_goal), last_response, goal_limit=turn_limit)
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
@@ -1748,25 +1849,30 @@ def run_kanban_goal_loop(
             return _result("stopped", f"worker failed: {failure_reason}")
         turns_used += 1
 
-
 __all__ = [
     "CONTINUATION_PROMPT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
+    "DEFAULT_GOAL_LIMIT",
     "DEFAULT_MAX_TURNS",
     "DRAFT_CONTRACT_SYSTEM_PROMPT",
+    "HOOK_GOAL_TEXT_LIMIT",
     "JUDGE_USER_PROMPT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "KANBAN_GOAL_PHASES",
+    "GoalBlock",
     "GoalContract",
     "GoalGate",
     "GoalManager",
     "GoalState",
+    "HookGoalText",
     "clear_goal",
     "draft_contract",
     "judge_goal",
+    "kanban_goal_text",
     "load_goal",
     "migrate_goal_to_session",
     "parse_contract",

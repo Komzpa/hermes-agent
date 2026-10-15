@@ -825,7 +825,8 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
+def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, board: Optional[str] = None,
+                                 phase: str = "complete"):
     """Goal judge for every terminal worker handoff (including review).
 
     Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
@@ -848,7 +849,14 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
     if client is None or not model:
         return ("done", None)
 
-    from hermes_cli.goals import judge_goal
+    from hermes_cli.goals import (
+        DEFAULT_GOAL_LIMIT, HOOK_GOAL_TEXT_LIMIT, HookGoalText, judge_goal, kanban_goal_text,
+    )
+
+    resolved = kanban_goal_text(task, board=board, phase=phase)
+    if isinstance(resolved, dict):
+        return ("blocked", resolved.get("reason") or "transform_kanban_goal hook blocked the task")
+    goal_limit = HOOK_GOAL_TEXT_LIMIT if isinstance(resolved, HookGoalText) else DEFAULT_GOAL_LIMIT
 
     verdict, reason, transport_failed = "done", "", False
     try:
@@ -858,8 +866,8 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task.id}")
         try:
             verdict, reason, _, _, transport_failed = judge_goal(
-                goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                last_response=evidence.strip())
+                goal=str(resolved),
+                last_response=evidence.strip(), goal_limit=goal_limit)
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
@@ -879,11 +887,13 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
 
 
 def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: str,
-                     continue_hint: str) -> Optional[str]:
+                     continue_hint: str, board: Optional[str] = None) -> Optional[str]:
     """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
     applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
     None to allow."""
-    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
+    phase = "review" if "review" in handoff else "complete"
+    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence, board=board,
+                                                      phase=phase)
     if verdict == "blocked":
         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
                 f"the goal unachievable — {rejection}. {blocked_hint}")

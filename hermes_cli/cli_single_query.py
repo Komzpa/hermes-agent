@@ -69,15 +69,25 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, 
     from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_db_connect as _kbc
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import kanban_goal_text as _kanban_goal_text
 
-    # Goal text = title + body (the acceptance criteria the judge evaluates against).
+    # Goal text = title + body (the acceptance criteria the judge evaluates against),
+    # transformable by transform_kanban_goal hooks (phase "turn").
     with _kbc.connect_closing() as conn:
         task = _kb.get_task(conn, task_id)
     if task is None:
         return
 
-    goal_text = "\n\n".join(p for p in (task.title or "", task.body) if p).strip()
-    if not goal_text:
+    board = os.environ.get("HERMES_KANBAN_BOARD")
+    goal_text = _kanban_goal_text(task, board=board, phase="turn")
+    if isinstance(goal_text, dict):
+        with _kbc.connect_closing() as c:
+            _kb.block_task(c, task_id, reason=goal_text.get("reason") or
+                           "transform_kanban_goal hook blocked the task",
+                           expected_run_id=worker_run_id)
+        return
+    goal_text = str(goal_text)
+    if not goal_text.strip():
         return
 
     def _quiet_turn(prompt: str) -> dict:
@@ -106,7 +116,7 @@ def _run_kanban_goal_loop_q(cli: HermesCLI, first_response: str, run_turn=None, 
         task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
         task_status_fn=_task_status, block_fn=_block,
         max_turns=task.goal_max_turns or _DEF_TURNS, first_response=first_response or "",
-        log=log or (lambda m: logger.info("%s", m)),
+        log=log or (lambda m: logger.info("%s", m)), board=board,
     )
 
 
