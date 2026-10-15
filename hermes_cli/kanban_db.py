@@ -3279,6 +3279,7 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    expected_status: str | None = None, expected_event_id: int | None = None,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3296,10 +3297,20 @@ def request_review(
     upload. A declared artifact that cannot be preserved raises
     :class:`ArtifactPreservationError`, rolling the whole transition back: the
     task stays ``running`` and retryable, with no attachments and no event.
+
+    ``expected_status`` (``ready``, ``blocked``, ``todo`` or ``triage``) also permits that
+    origin status; for that origin the task must hold no claim (``claim_lock``,
+    ``current_run_id`` and ``worker_pid`` NULL). ``expected_event_id`` refuses the
+    transition when ``MAX(task_events.id)`` for the task has moved. A CAS miss
+    returns ``False``. Inside an enclosing ``write_txn`` the transition runs as a
+    savepoint.
     """
 
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
+
+    if expected_status not in (None, "ready", "blocked", "todo", "triage"):
+        raise ValueError(f"unsupported expected_status: {expected_status!r}")
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
@@ -3312,7 +3323,7 @@ def request_review(
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
     staged_copies: list[Path] = []
     try:
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=True):
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
@@ -3321,6 +3332,12 @@ def request_review(
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
+            if expected_event_id is not None:
+                latest = conn.execute(
+                    "SELECT MAX(id) FROM task_events WHERE task_id = ?", (task_id,),
+                ).fetchone()[0]
+                if latest != int(expected_event_id):
+                    return _ret(False, "task_events moved since expected_event_id")
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).
@@ -3358,8 +3375,13 @@ def request_review(
                 implementer = trow["assignee"]
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
+            status_sql = "(status IN ('running', 'ready')" + (
+                "" if expected_status is None else
+                " OR (status = ? AND claim_lock IS NULL AND current_run_id IS NULL AND worker_pid IS NULL)"
+            ) + ")"
             params: tuple[Any, ...] = (
                 *(() if reviewer is None else (reviewer,)), task_id,
+                *(() if expected_status is None else (expected_status,)),
                 *(() if expected_run_id is None else (int(expected_run_id),)),
             )
             cur = conn.execute(
@@ -3371,7 +3393,7 @@ def request_review(
                        worker_pid    = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND """ + status_sql + """
                 """ + run_guard,
                 params,
             )
