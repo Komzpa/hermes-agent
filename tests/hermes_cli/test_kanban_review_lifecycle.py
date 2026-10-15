@@ -690,7 +690,7 @@ def test_review_reopen_bypasses_active_pr_guard_only_during_correction(
     """An explicit correction reuses its PR without weakening duplicate guards."""
     pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="correct same PR", assignee="worker")
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None

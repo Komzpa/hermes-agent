@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
 
 
@@ -39,10 +41,10 @@ def test_veto_leaves_task_unclaimed_and_does_not_spawn(
         lambda **kwargs: {"action": "skip", "reason": "provider_auth_unavailable"}
     )
     spawned = []
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(conn, title="guard me", assignee="worker")
-        result = kb.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: spawned.append(args))
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: spawned.append(args))
         task = kb.get_task(conn, task_id)
     finally:
         conn.close()
@@ -60,10 +62,10 @@ def test_raising_preclaim_hook_fails_closed(
         raise RuntimeError("auth probe crashed")
 
     hook_registry._hooks.setdefault("pre_kanban_task_claim", []).append(broken)
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(conn, title="guard me", assignee="worker")
-        result = kb.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: 123)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: 123)
         task = kb.get_task(conn, task_id)
     finally:
         conn.close()
@@ -79,10 +81,10 @@ def test_allow_preserves_normal_dispatch(
     hook_registry._hooks.setdefault("pre_kanban_task_claim", []).append(
         lambda task_id, assignee: {"action": "allow"}
     )
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         task_id = kb.create_task(conn, title="go", assignee="worker")
-        result = kb.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: 123)
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: 123)
     finally:
         conn.close()
 

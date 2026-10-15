@@ -1571,7 +1571,7 @@ def _run_preclaim_gate(
         if not has_hook("pre_kanban_task_claim"):
             return None
     except Exception as exc:
-        _log.warning("pre-claim gate failed for %s: %s", task_id, exc)
+        _kb._log.warning("pre-claim gate failed for %s: %s", task_id, exc)
         return "preclaim_gate_error"
     try:
         from hermes_cli.profiles import get_active_profile_name
@@ -1592,13 +1592,14 @@ def _run_preclaim_gate(
     try:
         callbacks = iter_hook_callbacks("pre_kanban_task_claim")
     except Exception as exc:
-        _log.warning("pre-claim hook failed for %s: %s", task_id, exc)
+        _kb._log.warning("pre-claim hook failed for %s: %s", task_id, exc)
         return "preclaim_hook_error"
     for callback in callbacks:
         try:
-            decision = callback(**payload)
+            from hermes_cli.plugins_dispatch import PluginDispatchMixin
+            decision = PluginDispatchMixin._invoke_hook_callback(callback, payload)
         except Exception as exc:
-            _log.warning("pre-claim hook failed for %s: %s", task_id, exc)
+            _kb._log.warning("pre-claim hook failed for %s: %s", task_id, exc)
             return "preclaim_hook_error"
         if decision is None:
             continue
