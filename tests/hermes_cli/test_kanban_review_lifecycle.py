@@ -701,7 +701,7 @@ def test_review_reopen_bypasses_active_pr_guard_only_during_correction(
         )
 
         assert kb.reopen_review_task(conn, task_id)
-        assert kb.check_respawn_guard(conn, task_id) is None
+        assert kbd.check_respawn_guard(conn, task_id) is None
 
         correction = kb.claim_task(conn, task_id)
         assert correction is not None
@@ -716,7 +716,7 @@ def test_review_reopen_bypasses_active_pr_guard_only_during_correction(
                 "claim_expires = NULL WHERE id = ?",
                 (task_id,),
             )
-        assert kb.check_respawn_guard(conn, task_id) == "active_pr"
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
 
 
 def test_review_dispatch_honors_global_and_per_profile_caps(
