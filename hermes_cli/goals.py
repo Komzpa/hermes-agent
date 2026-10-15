@@ -1704,7 +1704,7 @@ def run_kanban_goal_loop(
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task_id}")
         try:
-            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response, goal_limit=kanban_goal_limit(goal_text))
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
