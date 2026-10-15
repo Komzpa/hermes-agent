@@ -82,6 +82,20 @@ def test_hold_withholds_as_held(monkeypatch):
     ) == "held"
 
 
+def test_plain_error_classifies_failed_while_held_stays_held():
+    """The held: marker must not swallow real delivery errors: a plain error
+    string still classifies as "failed" (upstream semantics), while the
+    plugin-withheld "held:<plugin>:<reason>" marker classifies as "held"."""
+    assert _classify_delivery_outcome(
+        delivery_error="send blew up", should_deliver=True, unresolved_origin=False,
+        normalized_deliver="local", incident_acked=False, success=True,
+    ) == "failed"
+    assert _classify_delivery_outcome(
+        delivery_error="held:kanban:ingest-failed", should_deliver=True, unresolved_origin=False,
+        normalized_deliver="local", incident_acked=False, success=True,
+    ) == "held"
+
+
 def test_first_valid_directive_wins(monkeypatch):
     manager = _isolate_hooks(monkeypatch)
     manager._hooks.setdefault("pre_result_delivery", []).extend([
