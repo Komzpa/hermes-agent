@@ -137,9 +137,9 @@ def test_restored_body_is_truncated_per_message():
     """A recovered body cannot crowd the prompt: _CONTENT_MAX still applies."""
     compressor = _make_compressor()
     body = "x" * (ContextCompressor._CONTENT_MAX * 4)
-    turns = [_tool_msg("call-1", "[read_file] read big.txt from line 1")]
+    turns = [_tool_msg("call-1", "[read_file] read big.txt from line 1 (24,000 chars)")]
 
     text = compressor._serialize_for_summary(turns, {"call-1": body})
 
-    assert "[truncated]" in text
+    assert "HERMES-CONTEXT-COMPRESSION" in text
     assert len(text) < ContextCompressor._CONTENT_MAX * 2

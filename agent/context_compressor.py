@@ -3529,7 +3529,10 @@ class ContextCompressor(
             # the summary carries the content forward, not just the receipt.
             # Restoration happens before redaction so a recovered body is
             # scrubbed on exactly the same path as a live one.
-            if pristine and role == "tool":
+            # Only restore over a generic summary/demotion stub — structured
+            # tool summaries (e.g. clarify answers) already carry the payload
+            # the summarizer needs and must not be replaced by raw JSON.
+            if pristine and role == "tool" and _is_summary_stub(content or ""):
                 original = pristine.get(str(msg.get("tool_call_id") or ""))
                 if original and len(original) > len(content or ""):
                     content = original
