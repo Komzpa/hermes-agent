@@ -1876,6 +1876,7 @@ def _append_event(
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Close the active run (``status`` defaults to ``outcome``) and clear
     ``current_run_id``; None when no run was active (never-claimed task).
@@ -1883,12 +1884,15 @@ def _end_run(
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
     is wiped, and :func:`kanban_db_dispatch.reap_terminal_workers` needs them
-    to end a worker that survived its own terminal transition."""
+    to end a worker that survived its own terminal transition.
+
+    When ``expected_run_id`` is set, refuse to close any other run so a stale
+    finalizer cannot end a successor attempt."""
     now = int(time.time())
     run_id = _current_run_id(conn, task_id)
-    if run_id is None:
+    if run_id is None or (expected_run_id is not None and run_id != expected_run_id):
         return None
-    conn.execute(
+    cur = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -1903,7 +1907,12 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if cur.rowcount != 1:
+        return None
+    conn.execute(
+        "UPDATE tasks SET current_run_id = NULL WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
+    )
     return run_id
 
 
