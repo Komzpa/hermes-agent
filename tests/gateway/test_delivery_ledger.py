@@ -30,6 +30,20 @@ def _fresh_db(tmp_path, monkeypatch):
     yield
 
 
+def test_delivery_ledger_initialization_applies_wal_fallback(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "hermes_state_wal.apply_wal_with_fallback",
+        lambda conn, *, db_label: calls.append((conn, db_label)),
+    )
+    conn = sqlite3.connect(":memory:")
+    try:
+        dl._initialize_schema(conn)
+        assert calls == [(conn, "state.db (delivery_ledger)")]
+    finally:
+        conn.close()
+
+
 def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
     dl.record_obligation(
         obligation_id=oid,
