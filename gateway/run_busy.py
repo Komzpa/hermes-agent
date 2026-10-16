@@ -578,8 +578,7 @@ class GatewayBusySessionMixin:
             accepted = self._queue_or_replace_pending_event(session_key, event)
             message = (
                 t("gateway.busy.drain_queued", action=self._status_action_gerund())
-                if accepted else
-                t("gateway.busy.drain_rejected")
+                if accepted else t("gateway.busy.drain_rejected", action=self._status_action_gerund())
             )
         else:
             message = t("gateway.busy.drain_rejected", action=self._status_action_gerund())
@@ -931,12 +930,14 @@ class GatewayBusySessionMixin:
         # Queue as the next turn — skipped after a successful steer/redirect (the text is already in
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
         queued = True
-        if not _steer.steered and not _steer.redirected:
+        redirected = _steer.redirected
+        if not _steer.steered and not redirected:
             queued = self._queue_or_replace_pending_event(session_key, event)
         if not queued:
             await self._send_busy_ack_reply(
                 event, adapter,
-                t("gateway.busy.drain_rejected"),
+                "⚠️ I could not safely queue that follow-up while the current request is running. "
+                "Please send it again after the current turn finishes.",
             )
             return True
         # Store the message so it's processed as the next turn after the current run finishes (or is
