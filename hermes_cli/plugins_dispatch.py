@@ -47,6 +47,9 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "post_gateway_admission",
     # Observer on every local session's commands, fired by the gateway (gateway/session_commands.py).
     "pre_command",
+    # Fail-open result-delivery directive (cron + kanban): a hung plugin must not stall delivery;
+    # a timeout degrades to a normal send.
+    "pre_result_delivery",
 }
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.
