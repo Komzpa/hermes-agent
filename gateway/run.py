@@ -17837,6 +17837,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{message_text}"
                 )
 
+        # Keep the replied-to Telegram message id on the per-turn user text.
+        # The bridge needs this volatile id to route replies to their origin;
+        # putting it in the cached system prompt would invalidate prompt reuse.
+        if (
+            source is not None
+            and getattr(source, "platform", None) == Platform.TELEGRAM
+            and getattr(event, "reply_to_message_id", None)
+        ):
+            message_text = (
+                f"[Telegram reply target message_id: `{event.reply_to_message_id}`]\n\n"
+                f"{message_text}"
+            )
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer — even when the quoted text
             # already appears in history. The prefix isn't deduplication, it's

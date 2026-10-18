@@ -26,14 +26,15 @@ def _make_runner() -> GatewayRunner:
     return runner
 
 
-def _source() -> SessionSource:
+def _source(platform=Platform.TELEGRAM) -> SessionSource:
     return SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=platform,
         chat_id="123",
         chat_name="DM",
         chat_type="private",
         user_name="Alice",
     )
+
 
 
 @pytest.mark.asyncio
@@ -98,4 +99,43 @@ async def test_reply_prefix_still_injected_when_text_in_history():
     assert result.startswith(f'[Replying to: "{quoted}"]')
     assert result.endswith("What's the best time to go?")
 
+
+@pytest.mark.asyncio
+async def test_telegram_reply_target_id_is_exposed_without_quoted_text():
+    runner = _make_runner()
+    source = _source()
+    event = MessageEvent(
+        text="тест ответа в omp",
+        source=source,
+        reply_to_message_id="14303",
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result is not None
+    assert result.startswith("[Telegram reply target message_id: `14303`]")
+    assert result.endswith("тест ответа в omp")
+
+
+@pytest.mark.asyncio
+async def test_non_telegram_reply_target_id_is_not_exposed():
+    runner = _make_runner()
+    source = _source(platform=Platform.DISCORD)
+    event = MessageEvent(
+        text="follow-up",
+        source=source,
+        reply_to_message_id="14303",
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert result == "follow-up"
 
