@@ -245,17 +245,39 @@ def _signal_reconnect_and_wait(server_name: str, srv: Any, *, op_description: st
     return _wait_for_server_session_ready(srv, old_session=old_session, timeout=timeout)
 
 
+# Upper bound on how long _ensure_mcp_loop waits for a freshly started loop thread to enter
+# run_forever. Normally microseconds; seconds only on a heavily loaded host.
+_MCP_LOOP_START_TIMEOUT = 5.0
+# (loop, Event set by that loop's first callback) for the most recently created MCP loop.
+_loop_start: Optional[tuple[asyncio.AbstractEventLoop, threading.Event]] = None
+
+
 def _ensure_mcp_loop():
     """Start the background loop thread if not running. The loop/thread handles live on the ORIGIN
     module (tests read and reset ``tools.mcp_tool._mcp_loop``), so they are written there."""
+    global _loop_start
     from tools import mcp_tool as _origin
     with _core._lock:
-        if _origin._mcp_loop is not None and _origin._mcp_loop.is_running():
+        loop, thread = _origin._mcp_loop, _origin._mcp_thread
+        if loop is not None and loop.is_running():
             return
-        loop = _origin._mcp_loop = asyncio.new_event_loop()
-        loop.set_exception_handler(_mcp_loop_exception_handler)
-        _origin._mcp_thread = threading.Thread(target=loop.run_forever, name="mcp-event-loop", daemon=True)
-        _origin._mcp_thread.start()
+        started = _loop_start[1] if _loop_start is not None and _loop_start[0] is loop else None
+        # Created but not yet inside run_forever (the thread was started and has not been scheduled
+        # yet): wait for it below instead of replacing it with a second loop and thread.
+        if not (loop is not None and started is not None and not started.is_set()
+                and not loop.is_closed() and thread is not None and thread.is_alive()):
+            loop = _origin._mcp_loop = asyncio.new_event_loop()
+            loop.set_exception_handler(_mcp_loop_exception_handler)
+            started = threading.Event()
+            _loop_start = (loop, started)
+            loop.call_soon(started.set)  # first callback run_forever executes: is_running() is True
+            _origin._mcp_thread = threading.Thread(target=loop.run_forever, name="mcp-event-loop", daemon=True)
+            _origin._mcp_thread.start()
+    # Wait outside the lock: the caller schedules onto the loop right after this returns, and
+    # _run_on_mcp_loop refuses a loop that is not running yet (#140429). Bounded so a wedged
+    # thread start surfaces as the usual "not running" error instead of a hang.
+    if not started.wait(_MCP_LOOP_START_TIMEOUT):
+        logger.warning("MCP event loop thread did not start within %.1fs", _MCP_LOOP_START_TIMEOUT)
 
 
 def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
